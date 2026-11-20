@@ -630,7 +630,10 @@ def _vectorise_inner_loops(joined):
     # gets slower (short inner loops under already-collapsed owners) and one
     # of the physics files faults after promotion (not yet bisected); the
     # spectral transforms / hdiffu / mpe2d are where promotion pays off.
-    default_skip = ("ndslfv,mod_ndslfv,diabat,gwd,prerrtmg,stochastic,module_mp,samf,moninedmf,"
+    # 2026-11-20 (afar 24.4.0, 8 GPU): diabat and gwdc promoted - gwdc 22.0 -> 1.8 ms/step,
+    # diabat's own kernels 28.7 -> 12.8, six sptend bit-identical; enabling every physics
+    # file segfaults on the host in getrdy (one of the four listed after mod_ndslfv).
+    default_skip = ("ndslfv,mod_ndslfv,stochastic,prerrtmg,nor_gwdp,gwdps,module_mp,samf,moninedmf,"
                     "rrtmg,adjptqintp,radsw,mfpbl,ozphys,prexp,mp_scheme,lightning,dcyc2")
     skip = [x for x in os.environ.get("GEPS_ACC2OMP_VECTORISE_SKIP", default_skip).split(",") if x]
     if skip and any(x in _CURRENT_FILE for x in skip):
