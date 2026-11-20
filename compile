@@ -79,6 +79,9 @@ if [[ -f /usr/share/modules/init/bash ]]; then
 elif [[ -f /usr/share/Modules/init/bash ]]; then
   # shellcheck disable=SC1091
   . /usr/share/Modules/init/bash
+elif [[ -f /usr/share/lmod/lmod/init/bash ]]; then
+  # shellcheck disable=SC1091
+  . /usr/share/lmod/lmod/init/bash
 else
   echo "[ERROR] environment-modules init script not found" >&2
   exit 1

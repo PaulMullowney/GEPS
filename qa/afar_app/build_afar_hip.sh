@@ -12,10 +12,14 @@ export ROCM_PATH=${ROCM_PATH:-/opt/afar/current}
 export GEPS_LIB_ROOT=${GEPS_LIB_ROOT:-$(cd "$GEPS/../GEPS_LIB_afar" && pwd)}
 export GEPS_OPENMPI_MODULEFILES=$GEPS_LIB_ROOT/install/modulefiles
 export GEPS_COMPILER=rocm
-. /usr/share/modules/init/bash && module purge
+for _modinit in /usr/share/modules/init/bash /usr/share/lmod/lmod/init/bash; do
+  [ -f "$_modinit" ] && . "$_modinit" && break
+done
+module purge
 source "$GEPS_LIB_ROOT/env.sh" && load_geps_compiler
 module use "$GEPS_LIB_ROOT/install/modulefiles" && module load geps/1.0
-export ROCM_PATH=/opt/afar/current GEPS_LIB_ROOT
+# a site afar module (Lmod) sets ROCM_PATH to its own prefix; otherwise keep the default above
+export ROCM_PATH GEPS_LIB_ROOT
 export COMP_MP=mpifort C_COMP_MP=mpicc CXX_COMP_MP=mpicxx
 cd "$GEPS"
 echo "[afar] $(amdflang --version | head -1)  mpifort=$(command -v mpifort)  -> $BLD"

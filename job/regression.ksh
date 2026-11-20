@@ -52,11 +52,11 @@
    DMSFLAG=GK
  fi
 
- dtg='22081500'
+ dtg=${GEPS_DTG:-22081500}
  if [ -x /users/xb80/bin/Caldtg.ksh ]; then
    fgdtg=$(/users/xb80/bin/Caldtg.ksh ${dtg} -6)
  else
-   fgdtg='22081418'
+   fgdtg=$(date -u -d "20${dtg:0:6} ${dtg:6:2}:00 6 hours ago" +%y%m%d%H)
  fi
 
  idmshead='MASOPS'
@@ -96,7 +96,7 @@
 
   # TCo IC data path
   if [ ${rocm_lab} = 1 ]; then
-    export source="${dmsdb_home}/ncep_ana_n1.ufs/TCo${JCAP}l72_${dtg}"
+    export source="${GEPS_IC_DIR:-${dmsdb_home}/ncep_ana_n1.ufs/TCo${JCAP}l72_${dtg}}"
   else
     export source="/data/common/gfs/dms_data/ncep_ana_n1.ufs/TCo${JCAP}l72_${dtg}"
   fi

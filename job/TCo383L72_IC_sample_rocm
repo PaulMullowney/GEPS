@@ -33,6 +33,9 @@ if [[ -f /usr/share/modules/init/bash ]]; then
 elif [[ -f /usr/share/Modules/init/bash ]]; then
   # shellcheck disable=SC1091
   . /usr/share/Modules/init/bash
+elif [[ -f /usr/share/lmod/lmod/init/bash ]]; then
+  # shellcheck disable=SC1091
+  . /usr/share/lmod/lmod/init/bash
 else
   echo "ERROR: environment-modules init not found"
   exit 1
@@ -46,26 +49,24 @@ if [[ -f "${GEPS_LIB_ROOT}/env.sh" ]]; then
 fi
 module use "${GEPS_LIB_ROOT}/install/modulefiles"
 module load geps/1.0
-module unuse "${GEPS_LIB_ROOT}/install/modulefiles"
 
+# Lmod deactivates loaded modules when their path is unused, so keep both paths.
 module use "${MDIR}/modulefiles"
 module load modulefile.tcogfs.rocm
-module unuse "${MDIR}/modulefiles"
-
-# geps/1.0 setenv GEPS_LIB_ROOT; unuse of its modulepath can drop it.
-export GEPS_LIB_ROOT="$(cd "${MDIR}/../GEPS_LIB" && pwd)"
 
 # --- preflight ---
-EXE="${MDIR}/build_rocm_hip/bin/tcogfs.x"
-IC="${GEPS_DMSDB}/ncep_ana_n1.ufs/TCo${JCAP}l72_22081500"
+EXE="${MDIR}/${GEPS_ROCM_BUILD_DIR:-build_rocm_hip}/bin/tcogfs.x"
+GEPS_DTG="${GEPS_DTG:-22081500}"
+GEPS_FGDTG=$(date -u -d "20${GEPS_DTG:0:6} ${GEPS_DTG:6:2}:00 6 hours ago" +%y%m%d%H)
+IC="${GEPS_IC_DIR:-${GEPS_DMSDB}/ncep_ana_n1.ufs/TCo${JCAP}l72_${GEPS_DTG}}"
 BCK="${GEPS_DMSDB}/bckdms.ufs/BCK_TCo${JCAP}_GI30S_xnew"
 O3_NUCHEM="${MDIR}/fix/ozprdlos_2015_new_sbuvO3_tclm15_nuchem.f77"
 O3_FALLBACK="${MDIR}/fix/global_o3prdlos.f77"
 
 fail=0
 for d in \
-  "${IC}/2022081500000000" \
-  "${IC}/2022081418000006" \
+  "${IC}/20${GEPS_DTG}000000" \
+  "${IC}/20${GEPS_FGDTG}000006" \
   "${BCK}"
 do
   if [[ ! -d "${d}" ]]; then
