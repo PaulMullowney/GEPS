@@ -1,0 +1,118 @@
+#!/bin/bash
+# 2026-11-20 variant: 64 MPI ranks, one per CPX partition of 8 MI325X (NPEX=1, NPEY=64).
+#   Does not run yet: a rank segfaults during RCCL comm setup (ROCM_PORT_HANDOFF.md §0).
+# 2026-11-20 variant: 32 MPI ranks, one per QPX partition of 8 MI325X (NPEX=1, NPEY=32).
+# 2026-09-16 variant: 2 MPI ranks on the two MI300X (NPEY=2); the 1-rank physics working set does not fit in 192 GB.
+# Lab smoke: 1 MPI on one full MI300X (GPU0).
+# 2026-09-10: lab now has TWO PHYSICAL MI300X, both NPS1/SPX. GPU[1] is a real
+# second card (PCI 0000:66:00.0), not a DPX partition. We still pin GPU0 only.
+set -x
+
+MDIR=$(cd ..; pwd)
+echo "MDIR=${MDIR}"
+
+machine=rocm
+TERR=GMTED30
+JCAP=383
+
+MPI=64
+OMP=1
+export OMP_NUM_THREADS=$OMP
+NPEX=1
+NPEY=64
+ulimit -s unlimited
+
+CMAKE_BUILD=1
+SMOKE=1
+export GEPS_DMSDB="${GEPS_DMSDB:-/mlsteam/workspace/data/geps/dmsdb}"
+
+# GEPS_LIB + MPI: native ROCm MPI if present, else self-built OpenMPI
+export GEPS_COMPILER=rocm
+export GEPS_LIB_ROOT="${GEPS_LIB_ROOT:-$(cd "${MDIR}/../GEPS_LIB" && pwd)}"
+_GEPS_LIB_ROOT_SEL="${GEPS_LIB_ROOT}"   # 2026-09-29: GEPS_LIB_ROOT=... overrides (afar toolchain test)
+export GEPS_OPENMPI_MODULEFILES="${GEPS_LIB_ROOT}/install/modulefiles"
+
+if [[ -f /usr/share/modules/init/bash ]]; then
+  # shellcheck disable=SC1091
+  . /usr/share/modules/init/bash
+elif [[ -f /usr/share/Modules/init/bash ]]; then
+  # shellcheck disable=SC1091
+  . /usr/share/Modules/init/bash
+elif [[ -f /usr/share/lmod/lmod/init/bash ]]; then
+  # shellcheck disable=SC1091
+  . /usr/share/lmod/lmod/init/bash
+else
+  echo "ERROR: environment-modules init not found"
+  exit 1
+fi
+module purge 2>/dev/null || true
+
+if [[ -f "${GEPS_LIB_ROOT}/env.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "${GEPS_LIB_ROOT}/env.sh"
+  load_geps_compiler
+fi
+module use "${GEPS_LIB_ROOT}/install/modulefiles"
+module load geps/1.0
+
+# Lmod deactivates loaded modules when their path is unused, so keep both paths.
+module use "${MDIR}/modulefiles"
+module load modulefile.tcogfs.rocm
+
+# geps/1.0 setenv GEPS_LIB_ROOT; unuse of its modulepath can drop it.
+export GEPS_LIB_ROOT="${_GEPS_LIB_ROOT_SEL}"
+
+# --- preflight ---
+EXE="${MDIR}/${GEPS_ROCM_BUILD_DIR:-build_rocm_hip}/bin/tcogfs.x"
+GEPS_DTG="${GEPS_DTG:-22081500}"
+GEPS_FGDTG=$(date -u -d "20${GEPS_DTG:0:6} ${GEPS_DTG:6:2}:00 6 hours ago" +%y%m%d%H)
+IC="${GEPS_IC_DIR:-${GEPS_DMSDB}/ncep_ana_n1.ufs/TCo${JCAP}l72_${GEPS_DTG}}"
+BCK="${GEPS_DMSDB}/bckdms.ufs/BCK_TCo${JCAP}_GI30S_xnew"
+O3_NUCHEM="${MDIR}/fix/ozprdlos_2015_new_sbuvO3_tclm15_nuchem.f77"
+O3_FALLBACK="${MDIR}/fix/global_o3prdlos.f77"
+
+fail=0
+for d in \
+  "${IC}/20${GEPS_DTG}000000" \
+  "${IC}/20${GEPS_FGDTG}000006" \
+  "${BCK}"
+do
+  if [[ ! -d "${d}" ]]; then
+    echo "ERROR: missing IC/BCK path: ${d}"
+    fail=1
+  fi
+done
+if [[ ! -x "${EXE}" ]]; then
+  echo "ERROR: missing HIP binary: ${EXE}"
+  fail=1
+fi
+if [[ ! -f "${O3_NUCHEM}" && ! -f "${O3_FALLBACK}" ]]; then
+  echo "ERROR: no ozone forcing file in ${MDIR}/fix"
+  fail=1
+fi
+if ! command -v rocm-smi >/dev/null 2>&1; then
+  echo "ERROR: rocm-smi not in PATH"
+  fail=1
+else
+  # Count real GPUs (Device Rev reads 0x.. on a real card, N/A on a partition).
+  # Since 2026-09-10 this reports 2 (two physical SPX MI300X); we only bind GPU0.
+  nreal=$(rocm-smi -i 2>/dev/null | grep -c 'Device Rev:.*0x' || true)
+  if [[ "${nreal}" -lt 1 ]]; then
+    echo "ERROR: need >=1 full GPU (Device Rev not N/A), rocm-smi saw ${nreal}"
+    rocm-smi || true
+    fail=1
+  fi
+fi
+if [[ ! -x "${GEPS_LIB_ROOT}/install/rocm/dms-4.0.0/bin/rdmsdbcrt" ]]; then
+  echo "ERROR: DMS tools missing under ${GEPS_LIB_ROOT}/install/rocm/dms-4.0.0/bin"
+  fail=1
+fi
+if [[ "${fail}" -ne 0 ]]; then
+  echo "preflight failed; not running getrdy"
+  exit 1
+fi
+echo "preflight OK  IC=${IC}  BCK=${BCK}  EXE=${EXE}"
+rocm-smi || true
+
+export GEPS_ROCM_DEVICES=${GEPS_ROCM_DEVICES:-$(seq -s, 0 63)}
+. "${MDIR}/job/regression.ksh"

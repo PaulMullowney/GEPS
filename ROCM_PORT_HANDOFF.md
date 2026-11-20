@@ -1,6 +1,6 @@
 # GEPS on AMD ROCm — 接手筆記 (Handoff)
 
-> 最後更新：2026-11-20（8 × MI325X、afar 24.4.0：0.356 s/步；見 §0 第一列、§5.1、§6 第 20–21 層、§9 8g）
+> 最後更新：2026-11-20 晚（8 × MI325X、afar 24.4.0：SPX 8 rank 0.334 s/步、QPX 32 rank 0.271 s/步；見 §0 第一、二列、§5.1、§6 第 20–21 層、§9 8g）
 > 目標：**讓 GEPS / TCoGFS 在 AMD MI300X (gfx942) 上跑起來**
 
 ---
@@ -9,6 +9,7 @@
 
 | 項目 | 狀態 |
 |---|---|
+| **2026-11-20 晚（8 × MI325X，GPU 分割）** | ✅ **QPX 32 rank 0.271 s/步**，比 SPX 8 rank（0.334）快 19%；DPX 16 rank 0.312（快 7%）；CPX 64 rank 跑不起來。皆為第 3–6 步、log 的 `Timing=`、不帶 profiler，binary 都是 `build_afar244_hip_adv`（`fe0896bb`：`cyclic_cell_ppm` 的 kstr/kend 搜尋改成每個 cell 一個 thread＋atomic min/max，搜尋 22 → <1 ms/步）。DPX、QPX 的 9 個 `bal` 與 6 個 `sptend` 與 8 GPU 逐位元相同。job：`job/TCo383L72_IC_sample_rocm_{16,32,64}gpu`（NPEX=1、NPEY=16/32/64）；切換方式與 rank 擺放見 §5.1。CPX：rank 54 在 `nccl_init`（`ncclCommInitRank`/`ncclCommSplit`）期間 SIGSEGV，RCCL 初始化先卡了 ~70 s；未追。壁鐘時間都 ~30–38 s，主要是啟動與 I/O。機器已還原 SPX/NPS1。 |
 | **2026-11-20 下午（8 × MI325X，afar 24.4.0）** | ✅ **8 GPU 0.356 s/步**（第 3–6 步，marker 計時；NVIDIA 8 × A100 參考 0.34 s，差約 5%）；上午 0.92 s。兩個改動：(1) **每個 rank 只看得到自己的 GPU**（`src/rocm/geps_rank_gpu.sh`，§6 第 20 層）：全部可見時每個 process 都在 device 0 配記憶體，rank 0 的 kernel 慢 2–3 倍、其他 rank 在 RCCL 等它 → 0.453 s；(2) **acc2omp 把更多經度迴圈折進 collapse**、物理開 vectorise（§6 第 21 層）→ 0.356 s。NNMI 9 個 `bal` 與 6 個 `sptend` 在 2、8 GPU 都與修改前逐位元相同。另：`rocprofv3 --memory-copy-trace` 會隨機 SIGSEGV（rocprofiler 本身的 bug，§6 第 21 層末），profile 時不要開。 |
 | **2026-11-20（MI325X，afar 24.3.0）** | ✅ **1-GPU（NPEY=1）路徑首次跑完 tau=1**，NNMI 三輪 `bal` 與 6 個 `sptend` 和 2 GPU 逐位元相同（2025-01-01 資料，5.3 s/步）。根因：單 rank 時同長度的南北兩條緯度共用一個 rocFFT plan，被兩個 FFT host thread 同時執行（§6 第 19 層）；修在 `src/rocm/rfftmlt_loop_gpu.f90`，2 GPU 結果不變。 |
 | ROCm CPU build (`build_rocm_cpu`, amdflang host-only OpenMP) | ✅ 可編、**可完整跑完 1 小時預報**（2026-08-27 01:52 的 log 有 `PROGRAM CWBGFS HAS ENDED`） |
@@ -150,6 +151,7 @@ export GEPS_LIB_ROOT=/mlsteam/workspace/data/geps/GEPS_LIB
 - 資料只有 **2025-01-01 00Z**：`GEPS_DTG=25010100 GEPS_IC_DIR=~/CWA/h7bm_geps/dmsdb/TCo383L72.ufs/TCo383l72_25010100 GEPS_DMSDB=~/CWA/geps_run/dmsdb`（§8）。run log 與 profile 放 `~/CWA/geps_run/`，不在 repo。
 - 建置一律從乾淨環境：`env -i HOME=$HOME USER=$USER PATH=/usr/local/bin:/usr/bin:/bin TERM=dumb ROCM_PATH=/opt/afar-24.4.0 GEPS_LIB_ROOT=… bash -lc 'qa/afar_app/build_afar_hip.sh <dir>'`——shell 裡殘留的 `module load afar/24.4.0` 曾讓 24.3.0 的 flang 壞掉。
 - afar 24.4.0 vs 24.3.0：數值差 1e-15～1e-13（不逐位元相同，但各自 run-to-run 逐位元相同）；24.4.0 的 rocprofv3 每步只慢 ~4%（24.3.0 的慢 2.6 倍），profile 用 24.4.0。rocFFT 快取 `qa/afar_app/rocfft_cache/afar_gfx942.db` 兩版共用（~74 MB）。
+- **GPU 分割（2026-11-20 晚，使用者同意後用 sudo，只用於切分割）**：預設 SPX/NPS1。DPX 只能配 NPS1，QPX、CPX 配 NPS4（本機 NPS caps 只有 NPS1、NPS4）。換 NPS 要重載 driver（~1 min）：`sudo rocm-smi --setmemorypartition NPS4 --autorespond y`（`amd-smi set -M` 沒有 `--autorespond`，會停在互動提問）。換 compute 分割要一張一張來，因為每換一張後面的 GPU id 都會重排：重複 `id=$(amd-smi partition --current | awk '$3=="<舊模式>"{print $1; exit}'); sudo amd-smi set -g $id -C <新模式>`（一次 `amd-smi set -C` 全部換，換完第一張就會 `AMDSMI_STATUS_BUSY`）。分割後 HSA 順序照 PCI bus 排（05、15、65、75 在 NUMA 0，85、95、e5、f5 在 NUMA 1），不是上一條的 SPX 順序，所以 rank r 用 device r、`--map-by ppr:<每 NUMA rank 數>:numa:PE=<64/每 NUMA rank 數> --bind-to core` 即可（DPX `ppr:8:numa:PE=8`、QPX `ppr:16:numa:PE=4`、CPX `ppr:32:numa:PE=2`）。RCCL 不接受同一張實體 GPU 上有多個 rank，所以 32 rank 不能在 SPX 上先試。CPX＋NPS4 是兩個分割共用 64 GB，試跑時設了 `GEPS_HSA_POOL_CAP_GB=24`；QPX、DPX 用預設 48 沒問題。
 - `HSA_XNACK=1` 是 2026-09-18 移植時就有的設定（沒有記錄原因）；8 GPU 用 `HSA_XNACK=0` 跑完、逐位元相同、profile 下快 ~8%，但未在不帶 profiler 下確認，預設不變（`regression.ksh` 可覆寫）。
 
 ---
