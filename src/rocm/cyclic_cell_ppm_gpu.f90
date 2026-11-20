@@ -99,55 +99,79 @@ subroutine cyclic_cell_ppm_intp_two_loops_gpu(outer_index, outer_size, inner_siz
    do ob = 1, outer_size, otile
       nloc = min(otile, outer_size - ob + 1)
 
-      !$omp target teams distribute parallel do collapse(2) private(og, imp, imf, pn_t, pnlocs, locs1, locs2, i) firstprivate(ob, nloc)
+      ! 2026-11-20: kstr/kend cell search parallel over i. The serial scans kept the
+      ! last match: the smallest i for the downward scans, the largest for the
+      ! upward ones, so atomic min/max over the same tests gives the same cells
+      ! (no monotonicity of the cell edges assumed). One thread per (ot, inner)
+      ! walked up to 2*imp cells: 22 ms/step on TCo383 8-GPU.
+      !$omp target teams distribute parallel do collapse(2) private(og, imf) firstprivate(ob, nloc)
+      do ot = 1, nloc
+         do inner = 1, inner_size
+            og = ob + ot - 1
+            if (nstep_less(inner, og)) then
+               imf = outer_index(3, og)
+               kstr(inner, ot) = 0
+               if (pn(1, inner, og) .lt. pp(1, inner, og)) kstr(inner, ot) = huge(1)
+               kend(inner, ot) = 0
+               if (pn(imf + 1, inner, og) .lt. pp(1, inner, og) + sc) kend(inner, ot) = huge(1)
+            end if
+         end do
+      end do
+
+      !$omp target teams distribute parallel do collapse(3) private(og, imp, imf, pn_t, pnlocs, locs1, locs2, kkn) firstprivate(ob, nloc)
+      do ot = 1, nloc
+         do inner = 1, inner_size
+            do i = 1, 3*lonn - 1
+               og = ob + ot - 1
+               if (nstep_less(inner, og)) then
+                  imp = outer_index(2, og)
+                  if (i .le. 3*imp - 1) then
+                     imf = outer_index(3, og)
+                     call locs_pp_map(pp(1, inner, og), i, lonn, imp, sc, locs1)
+                     call locs_pp_map(pp(1, inner, og), i + 1, lonn, imp, sc, locs2)
+                     pn_t = pn(1, inner, og)
+                     pnlocs = pp(1, inner, og)
+                     if ((pn_t .ge. locs1) .and. (pn_t .lt. locs2)) then
+                        if (pn_t .lt. pnlocs) then
+                           if (i .le. imp) then
+                              !$omp atomic update
+                              kstr(inner, ot) = min(kstr(inner, ot), i)
+                           end if
+                        else if (i .ge. imp + 1 .and. i .le. 2*imp) then
+                           !$omp atomic update
+                           kstr(inner, ot) = max(kstr(inner, ot), i)
+                        end if
+                     end if
+                     pn_t = pn(imf + 1, inner, og)
+                     pnlocs = pp(1, inner, og) + sc
+                     if (pn_t .ge. locs1 .and. pn_t .lt. locs2) then
+                        kkn = i + 1
+                        if (pn_t .lt. pnlocs) then
+                           if (i .ge. imp .and. i .le. 2*imp) then
+                              !$omp atomic update
+                              kend(inner, ot) = min(kend(inner, ot), kkn)
+                           end if
+                        else if (i .ge. 2*imp + 1) then
+                           !$omp atomic update
+                           kend(inner, ot) = max(kend(inner, ot), kkn)
+                        end if
+                     end if
+                  end if
+               end if
+            end do
+         end do
+      end do
+
+      !$omp target teams distribute parallel do collapse(2) private(og, imp) firstprivate(ob, nloc)
       do ot = 1, nloc
          do inner = 1, inner_size
             og = ob + ot - 1
             if (nstep_less(inner, og)) then
                imp = outer_index(2, og)
-               imf = outer_index(3, og)
-               pn_t = pn(1, inner, og)
-               kstr(inner, ot) = 0
-               pnlocs = pp(1, inner, og)
-               if (pn_t .lt. pnlocs) then
-                  do i = imp, 1, -1
-                     call locs_pp_map(pp(1, inner, og), i, lonn, imp, sc, locs1)
-                     call locs_pp_map(pp(1, inner, og), i + 1, lonn, imp, sc, locs2)
-                     if ((pn_t .ge. locs1) .and. (pn_t .lt. locs2)) then
-                        kstr(inner, ot) = i
-                     end if
-                  end do
-               else
-                  do i = imp + 1, 2*imp
-                     call locs_pp_map(pp(1, inner, og), i, lonn, imp, sc, locs1)
-                     call locs_pp_map(pp(1, inner, og), i + 1, lonn, imp, sc, locs2)
-                     if ((pn_t .ge. locs1) .and. (pn_t .lt. locs2)) then
-                        kstr(inner, ot) = i
-                     end if
-                  end do
-               end if
+               if (kstr(inner, ot) .eq. huge(1)) kstr(inner, ot) = 0
                if (kstr(inner, ot) .eq. 0) has_error = .true.
                kstr(inner, ot) = max(3, kstr(inner, ot))
-               pn_t = pn(imf + 1, inner, og)
-               kend(inner, ot) = 0
-               pnlocs = pp(1, inner, og) + sc
-               if (pn_t .lt. pnlocs) then
-                  do i = 2*imp, imp, -1
-                     call locs_pp_map(pp(1, inner, og), i, lonn, imp, sc, locs1)
-                     call locs_pp_map(pp(1, inner, og), i + 1, lonn, imp, sc, locs2)
-                     if (pn_t .ge. locs1 .and. pn_t .lt. locs2) then
-                        kend(inner, ot) = i + 1
-                     end if
-                  end do
-               else
-                  do i = 2*imp + 1, 3*imp - 1
-                     call locs_pp_map(pp(1, inner, og), i, lonn, imp, sc, locs1)
-                     call locs_pp_map(pp(1, inner, og), i + 1, lonn, imp, sc, locs2)
-                     if (pn_t .ge. locs1 .and. pn_t .lt. locs2) then
-                        kend(inner, ot) = i + 1
-                     end if
-                  end do
-               end if
+               if (kend(inner, ot) .eq. huge(1)) kend(inner, ot) = 0
                if (kend(inner, ot) .eq. 0) has_error = .true.
                kend(inner, ot) = min(3*imp - 2, kend(inner, ot))
             end if
