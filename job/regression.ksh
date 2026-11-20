@@ -372,7 +372,8 @@ EOF
  if [ $CMAKE_BUILD = 1 ] ; then
    if [ ${machine} = rocm ]; then
 	# GEPS_PROF_WRAP="rocprofv3 --kernel-trace --stats -d /path -o r_%pid% --" prefixes the binary (2026-09-18)
-	FCT_MODEL="${GEPS_PROF_WRAP:-} $MDIR/${GEPS_ROCM_BUILD_DIR:-build_rocm_hip}/bin/tcogfs.x"
+	# 2026-11-20: src/rocm/geps_rank_gpu.sh masks each rank to its own GPU (GEPS_RANK_GPU_MASK=0 disables)
+	FCT_MODEL="$MDIR/src/rocm/geps_rank_gpu.sh ${GEPS_PROF_WRAP:-} $MDIR/${GEPS_ROCM_BUILD_DIR:-build_rocm_hip}/bin/tcogfs.x"
    elif [ ${machine} = rocm_cpu ]; then
 	FCT_MODEL=$MDIR/build_rocm_cpu/bin/tcogfs.x
    else
@@ -405,13 +406,17 @@ EOF
   export GEPS_ROCM_PCI="${GEPS_ROCM_PCI:-0000:46:00.0}"
   # 2026-09-16: GEPS_ROCM_DEVICES="0,1" runs on both cards (one MPI rank per
   # card, device_init picks mod(rank, ndevices)); default stays GPU0 only.
-  export HIP_VISIBLE_DEVICES="${GEPS_ROCM_DEVICES:-0}"
+  # HIP_VISIBLE_DEVICES / GPU_DEVICE_ORDINAL index the list ROCR already filtered, so
+  # they get 0..n-1: passing a reordered list (e.g. 1,0,...) to both gives HIP and
+  # OpenMP different device 0s and the GPU memory-faults.
   export ROCR_VISIBLE_DEVICES="${GEPS_ROCM_DEVICES:-0}"
-  export GPU_DEVICE_ORDINAL="${GEPS_ROCM_DEVICES:-0}"
+  _geps_ndev=$(echo "${ROCR_VISIBLE_DEVICES}" | tr ',' '\n' | grep -c .)
+  export HIP_VISIBLE_DEVICES=$(seq -s, 0 $((_geps_ndev - 1)))
+  export GPU_DEVICE_ORDINAL="${HIP_VISIBLE_DEVICES}"
   export OMP_DEFAULT_DEVICE=0
   export OMP_NUM_THREADS=1
   export OMP_TARGET_OFFLOAD=MANDATORY
-  export HSA_XNACK=1
+  export HSA_XNACK=${HSA_XNACK:-1}
   # 2026-09-29: blit kernels instead of SDMA for copies. omp_target_memcpy D2D goes
   # 58 -> 1240 GB/s (qa/rocm_toolchain_poc PoC 04); step 2.38 -> 2.25 s on 7.2.2,
   # 2.35 -> 2.27 s on afar, six sptend bit-identical. HSA_ENABLE_SDMA=1 restores SDMA.
@@ -462,15 +467,17 @@ EOF
   export OMPI_ALLOW_RUN_AS_ROOT=1
   export OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
  fi
+ # GEPS_MPI_ARGS: extra mpiexec options, e.g. rank placement next to each rank's GPU
+ # ("--map-by ppr:4:numa:PE=16 --bind-to core"; device = mod(rank, ndev) in device_init)
  if [ ${rocm_lab} = 1 ]; then
   ulimit -s unlimited
   if [ -x /usr/bin/time ]; then
-    /usr/bin/time -p mpiexec -n $MPI ${FCT_MODEL} -Wl,-T
+    /usr/bin/time -p mpiexec -n $MPI ${GEPS_MPI_ARGS:-} ${FCT_MODEL} -Wl,-T
   else
-    mpiexec -n $MPI ${FCT_MODEL} -Wl,-T
+    mpiexec -n $MPI ${GEPS_MPI_ARGS:-} ${FCT_MODEL} -Wl,-T
   fi
  else
-  /usr/bin/time -p mpiexec -n $MPI ${FCT_MODEL} -Wl,-T
+  /usr/bin/time -p mpiexec -n $MPI ${GEPS_MPI_ARGS:-} ${FCT_MODEL} -Wl,-T
  fi
 
  ###--- NVIDIA Nsight Systems tool for A100 ---###
