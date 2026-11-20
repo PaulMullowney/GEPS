@@ -1,6 +1,6 @@
 # GEPS on AMD ROCm — 接手筆記 (Handoff)
 
-> 最後更新：2026-09-15（逐波數 1:1 對照定位到水平半拉格朗日平流；見 §6 第 9 層末尾）
+> 最後更新：2026-11-20（8 × MI325X、afar 24.4.0：0.356 s/步；見 §0 第一列、§5.1、§6 第 20–21 層、§9 8g）
 > 目標：**讓 GEPS / TCoGFS 在 AMD MI300X (gfx942) 上跑起來**
 
 ---
@@ -9,6 +9,7 @@
 
 | 項目 | 狀態 |
 |---|---|
+| **2026-11-20 下午（8 × MI325X，afar 24.4.0）** | ✅ **8 GPU 0.356 s/步**（第 3–6 步，marker 計時；NVIDIA 8 × A100 參考 0.34 s，差約 5%）；上午 0.92 s。兩個改動：(1) **每個 rank 只看得到自己的 GPU**（`src/rocm/geps_rank_gpu.sh`，§6 第 20 層）：全部可見時每個 process 都在 device 0 配記憶體，rank 0 的 kernel 慢 2–3 倍、其他 rank 在 RCCL 等它 → 0.453 s；(2) **acc2omp 把更多經度迴圈折進 collapse**、物理開 vectorise（§6 第 21 層）→ 0.356 s。NNMI 9 個 `bal` 與 6 個 `sptend` 在 2、8 GPU 都與修改前逐位元相同。另：`rocprofv3 --memory-copy-trace` 會隨機 SIGSEGV（rocprofiler 本身的 bug，§6 第 21 層末），profile 時不要開。 |
 | **2026-11-20（MI325X，afar 24.3.0）** | ✅ **1-GPU（NPEY=1）路徑首次跑完 tau=1**，NNMI 三輪 `bal` 與 6 個 `sptend` 和 2 GPU 逐位元相同（2025-01-01 資料，5.3 s/步）。根因：單 rank 時同長度的南北兩條緯度共用一個 rocFFT plan，被兩個 FFT host thread 同時執行（§6 第 19 層）；修在 `src/rocm/rfftmlt_loop_gpu.f90`，2 GPU 結果不變。 |
 | ROCm CPU build (`build_rocm_cpu`, amdflang host-only OpenMP) | ✅ 可編、**可完整跑完 1 小時預報**（2026-08-27 01:52 的 log 有 `PROGRAM CWBGFS HAS ENDED`） |
 | ROCm GPU build (`build_rocm_hip`, OpenMP target offload + HIP) | ✅ 可編；✅ **2026-09-10 首次跑完全部 3 輪 NNMI 並進入預報積分**（換成 2 張實體 MI300X / SPX 之後）；❌ 但**數值是錯的**：`iteration=2` 起 VRAM 耗盡，垂直平流輸入 `dd` 全為零，積分第一步就 `surf pres tend rms(GPU) = NaN`，最後仍以 `HSA_STATUS_ERROR_OUT_OF_RESOURCES` 中止 |
@@ -140,6 +141,16 @@ export GEPS_LIB_ROOT=/mlsteam/workspace/data/geps/GEPS_LIB
   - **2026-10-15 已補進 `init.sh`**（比對 `/var/log/apt/history.log`）：`lbzip2 ksh m4`、`nodejs npm libreoffice-impress fonts-noto-cjk poppler-utils`、`rocm-bandwidth-test`；並在 `/root/.claude/projects` 不存在時從 `/mlsteam/workspace/claude_backup/` 還原 Claude 的記憶與 session 紀錄（`/root/.claude` 也在 overlay 上；備份用同目錄的 `backup.sh`）。原檔備份 `init.sh.bak-20261015`。以下是補之前的紀錄。
   - **`init.sh` 沒涵蓋、要另外補的**：`ksh`、`m4`（afar 重編 GEPS_LIB 時裝的；`regression.ksh` 也要 ksh）——`apt-get install -y ksh m4`。afar SDK `/opt/afar/`（`therock-afar-24.3.0-multiarch-10.1.0-592954c`、`current` 連結、9.1 GB 原始 `afar.tar.bz2`）**在 overlay rootfs 上，容器重建就沒了**；`GEPS_LIB_afar` 與 `build_afar_hip` 都依賴它。要保留就把 `afar.tar.bz2` 搬到 `/mlsteam/workspace`，重建後解回 `/opt/afar` 並重建 `current` 連結。完整安裝步驟與重建後的最短恢復指令：`qa/afar_app/INSTALL_AFAR.md`。
 - Smoke 設定（`SMOKE=1`）：`taue=1.0, tauo=1.0, taup=6.0`（taup 必須留 6，getrdy 才讀得到 22081418 的 6h FG）；`outgrb2=0, outdms=1`
+
+### 5.1 第二台機器（2026-11-20 起，MI325X）
+
+- **8 × MI325X**（gfx942，每張 304 CU、256 GB），2 × EPYC 9575F（2 NUMA × 64 核、256 thread），1.5 TB RAM。一般使用者、**沒有 sudo**（不要裝系統套件）；模組系統是 **Lmod**（job 腳本與 `build_afar_hip.sh` 已支援）。
+- **HSA／KFD 的 GPU 順序 ≠ `rocm-smi` 順序**：HSA index 0–7 = PCI 75、05、65、15、f5、85、e5、95（= rocm-smi 3、0、2、1、7、4、6、5）。`ROCR_VISIBLE_DEVICES` 用的是 HSA index；index 0–3 在 NUMA 0、4–7 在 NUMA 1，所以 `--map-by ppr:4:numa:PE=16 --bind-to core` 讓每個 rank 靠近自己的 GPU（實測只差 ~1.5%）。
+- 工具鏈：`/opt/afar-24.3.0`、`/opt/afar-24.4.0`（還有更舊的 afar；沒有 ROCm 7.2.2）。GEPS_LIB：`~/CWA/h7bm_geps/GEPS_LIB`（24.3.0）、`GEPS_LIB_afar244`（24.4.0；`env.sh`、`build_all.sh`、`module_temp_rocm/*` 的版本與 `ucx-1.24.0-dev-ucc` 已改）。afar 24.4.0 的 OpenMPI 5.0.10 是 ROCm-aware（UCX），但 GEPS 的 GPU 資料只走 RCCL，MPI 只傳 host 資料。
+- 資料只有 **2025-01-01 00Z**：`GEPS_DTG=25010100 GEPS_IC_DIR=~/CWA/h7bm_geps/dmsdb/TCo383L72.ufs/TCo383l72_25010100 GEPS_DMSDB=~/CWA/geps_run/dmsdb`（§8）。run log 與 profile 放 `~/CWA/geps_run/`，不在 repo。
+- 建置一律從乾淨環境：`env -i HOME=$HOME USER=$USER PATH=/usr/local/bin:/usr/bin:/bin TERM=dumb ROCM_PATH=/opt/afar-24.4.0 GEPS_LIB_ROOT=… bash -lc 'qa/afar_app/build_afar_hip.sh <dir>'`——shell 裡殘留的 `module load afar/24.4.0` 曾讓 24.3.0 的 flang 壞掉。
+- afar 24.4.0 vs 24.3.0：數值差 1e-15～1e-13（不逐位元相同，但各自 run-to-run 逐位元相同）；24.4.0 的 rocprofv3 每步只慢 ~4%（24.3.0 的慢 2.6 倍），profile 用 24.4.0。rocFFT 快取 `qa/afar_app/rocfft_cache/afar_gfx942.db` 兩版共用（~74 MB）。
+- `HSA_XNACK=1` 是 2026-09-18 移植時就有的設定（沒有記錄原因）；8 GPU 用 `HSA_XNACK=0` 跑完、逐位元相同、profile 下快 ~8%，但未在不帶 profiler 下確認，預設不變（`regression.ksh` 可覆寫）。
 
 ---
 
@@ -3971,6 +3982,55 @@ TCo 南北對稱，緯度 `j` 與 `latf+1-j` 同長；`make_list.f90` 以 cyclic
 
 **教訓**：改變 rank 數會改變 rank 內資料的組成（這裡是南北對稱的緯度同時在本地），共用資源（plan、work area）的假設要跟著重新檢查。
 
+#### ★★ 第 20 層（2026-11-20，已修好；效能）：8 GPU 時 rank 0 的每個 kernel 都慢 2–3 倍
+
+**症狀**（8 × MI325X、afar 24.4.0、`job/TCo383L72_IC_sample_rocm_8gpu`＝NPEX=1、NPEY=8）：每步 0.92 s（2 GPU 1.57 s，效率 43%）。
+profile：rank 1–7 每步在 `mpe_transpose_rs1_sp_gpu`（第 3 次 `tranrs1_gpu` 內的 RCCL kernel）等 ~300 ms——等的是 rank 0。
+rank 0 的 `diabat_gpu` kernel 403 ms vs 其他 196 ms；所有種類都慢：物理 2–2.5×、純搬資料的 `para_we2ns` 3.1×、rocSOLVER `syevj` 1.5×。
+
+**排除過程**（每次只改一個變數）：
+
+| 變數 | 結果 | 推論 |
+|---|---|---|
+| grid 大小、每 rank 的緯度數與點數 | 8 個 rank 完全相同（cyclic 分配，各 96 條） | 不是工作量不均 |
+| kernel 重疊 | overlap 1.00、單一 queue | 不是並行造成 |
+| rank 0 換到另一張卡（PCI 05） | 慢的跟著 rank 0 走 | 不是硬體 |
+| `HSA_XNACK=0` | 跑完、逐位元相同，rank 0 仍 2.1× | 不是 XNACK page migration |
+| `OMP_DEFAULT_DEVICE`＝rank | 不變 | 不是 OpenMP 預設裝置 |
+| 每 rank `ROCR_VISIBLE_DEVICES`＝自己的卡 | **rank 0 196 ms，與其他相同；步時減半** | ✅ |
+
+**根因（量到的部分）**：`/sys/class/kfd/kfd/proc/<pid>/vram_*` 顯示每個 process 在**每一張** GPU 上都有 ~0.5 GiB，rank 1–7 在 device 0（rank 0 的卡）上再多 0.3 GiB——device 選擇之前就有 HIP／函式庫配置落在 device 0。沒有任何其他 rank 的 kernel 跑在 device 0 上。
+**機制（假設，未量）**：device 0 上有 8 個 process 的 queue／context，硬體排程器在它們之間 time-slice。
+
+**修法**：`src/rocm/geps_rank_gpu.sh`（`regression.ksh` 在 rocm 分支自動包住執行檔）：GPU 列表多於 1 張時，`ROCR_VISIBLE_DEVICES`＝列表第 `mod(local rank, n)` 項（就是 device_init 原本會挑的那張）、`HIP_VISIBLE_DEVICES=GPU_DEVICE_ORDINAL=0`；`GEPS_RANK_GPU_MASK=0` 關掉。
+不能只設 `HIP_VISIBLE_DEVICES`：OpenMP 走 HSA、仍看得到 8 張，`geps_hip_set_device` 對兩邊用同一個 index（`hipSetDevice(use)`＋`omp_set_default_device(use)`），兩邊的 device 0 會是不同的卡（同一個 memory fault）。
+ecTrans `affinity.sh` 說 mask 會讓 UCX 的 GPU 間 IPC 退化；GEPS 的 GPU 資料走 RCCL，mask 後 RCCL 的等待也一起消失，沒有影響。
+
+**結果**：8 GPU 55.8 → 38.8 s wall、0.92 → 0.453 s/步；2 GPU 127 → 124 s（只有 1 個「別人」在 device 0，差別在雜訊內）；1、2、8 GPU 逐位元相同。
+
+**附帶修正（同一 commit）**：`regression.ksh` 原本把 `GEPS_ROCM_DEVICES` 同時給 `ROCR_`／`HIP_VISIBLE_DEVICES`／`GPU_DEVICE_ORDINAL`；後兩者是對 ROCR 過濾後的列表編號，重排的列表（`1,0,…`）讓 HIP 與 OpenMP 的 device 0 不同 → memory fault。現在後兩者固定 `0..n-1`。
+
+#### ★★ 第 21 層（2026-11-20，效能）：acc2omp 把物理的經度迴圈留成每個 thread 序列走
+
+**量測**（8 GPU masked、profile）：每步 471 ms，其中 162 ms 是 ≤19,456 thread（每 CU 不到一個 wave）的 OpenMP kernel——96 thread（每條緯度一個）或 6,912 thread（96 緯度 × 72 層），每個 thread 序列走最多 ~1,550 個經度。
+OpenACC 原碼是 `gang` 跑緯度（×層）、`vector` 跑經度；acc2omp 的兩個 pass 都沒接手：
+
+- `_vectorise_inner_loops`（gang→`teams distribute`、vector→`parallel do`）：預設 skip 清單關掉全部物理，理由是 2026-09-18 的「某個物理檔 promote 後 fault（未 bisect）」。
+- `_spmd_collapse_inner`（經度迴圈折進 collapse、原上界變 guard）：只收完美巢狀、body 裡不能有任何 acc 指令、檔名要在 `_SPMD_EXT`。
+
+**改動**（`cmake/acc2omp.py`；每個 column 執行的敘述與順序不變 ⇒ 逐位元相同）：
+1. vectorise 開 `diabat`、`gwdc`、`gwdps`、`nor_gwdp`、`stochastic`（只影響 owner 是單層緯度迴圈的 kernel）：`gwdc` 22.0 → 1.8 ms/步。`prerrtmg` 留在 skip：promote 會把它已經折好的 kernel 換掉。
+2. `_spmd_collapse_inner` 也折：body 裡有更深的 `loop`（本來就序列；`adjptqintp`）；經度迴圈在 `if (c) then … [else …] end if` 裡、每支一個（`c` 與前置 scalar 改成每個 column 算，若 column body 寫到它們讀的東西就不折；`prexp`）；`#if/#else/#endif` 兩支各有一份內層指令（`gsfcgce` `saticel_s`）；`_SPMD_EXT` 加 `mp_scheme_gpu: nx`、`prexp_hybrid: nxp`。`GEPS_ACC2OMP_SPMD_WHY=1` 印出每個沒折的候選與原因。
+   驗證方法：新舊兩版翻譯全部 121 個產生檔逐一 diff——只有預期的 folds（adjptqintp 2→4、gsfcgce 24→26、mp_scheme 0→2、prexp 0→1、ozphys 0→1、diabat 23→24）、縮排、`firstprivate→private`（變數在 body 內先賦值）與已知的 private 清單順序不定（tranrs1/trngra/hdiffu）。
+
+**結果**（profile 每步）：471 → 432（vectorise）→ 386 ms（fold）；`diabat_gpu` 209 → 120 ms（`mp_scheme` 97→65、`adjptqintp` 13→3.3、`prexp` 6.9→0.5）。marker 計時 **0.453 → 0.356 s/步**。2、8 GPU 逐位元相同。
+
+**那個「promote 後 fault」**：全開物理時 4 次 run 有 3 次在 host 端 SIGSEGV（rank 與時間點每次不同），**只在 `rocprofv3 --memory-copy-trace` 下發生**——不帶 profiler 或只開 kernel/marker trace 時 0 次（共 4 次）。core（apport 存在 `/var/lib/apport/coredump/`）：
+`hsaKmtSetEvent ← hsa_signal_subtract_screlease ← rocprofiler::hsa::async_copy::async_copy_handler ← Runtime::AsyncEventsLoop`，
+即 rocprofiler-sdk 在 copy 完成時轉送到一個已不存在的完成 signal。單獨開任何一個檔都沒重現，看起來與 copy 的數量／時序有關。不是 GEPS 的 bug；profile 時不要開 `--memory-copy-trace`（或接受隨機崩潰），值得回報 AMD。
+
+**剩下的**（每步，profile）：`src/rocm/cyclic_cell_ppm_gpu.f90` 的找格子迴圈 22 ms（手寫、序列走一整列）、`mp_scheme` 65 ms、kernel 之間的空檔 ~50 ms（每步 ~10,300 次 launch）、rocFFT ~55 ms（7,900 次小 launch，1,600 次 Bluestein）、RCCL 26 ms。見 §9 8g。
+
 #### 其他備忘
 - 工作樹裡 `eigen.f90`/`eigenlib.f90`/`eigrs.f90`/`initial.f90`/`mpe_init.f90`/`mpe_unify.f90` 的 `! #region agent log` 除錯探針，**經確認是給 CPU 路徑的 amdflang -O3 spill bug 用的（見上面已繞過的問題 1），跟這整段 GPU omptarget 崩潰無關**（GPU build 走的是 `initial_gpu.f90` 等 `src/nvidia/` 檔案，不是那些有探針的 CPU 檔案）。
 - `src/` 裡的這些 `! #region agent log` 探針（寫 NDJSON 到 `.cursor/debug-*.log`，其中一個已 49 MB）在 GPU port 收斂前可以獨立清掉，不影響 GPU 除錯。
@@ -4115,6 +4175,26 @@ cd /mlsteam/workspace/data/geps/GEPS/job && ./TCo383L72_IC_sample_rocm 2>&1 | te
 ```
 
 ```bash
+# MI325X 機器（§5.1）：建置（afar 24.4.0；加 GEPS_ACC2OMP_ROCTX=1 才有 profile 用的 ROCTx 範圍）
+cd ~/CWA/GEPS && env -i HOME=$HOME USER=$USER PATH=/usr/local/bin:/usr/bin:/bin TERM=dumb \
+  ROCM_PATH=/opt/afar-24.4.0 GEPS_LIB_ROOT=$HOME/CWA/h7bm_geps/GEPS_LIB_afar244 [GEPS_ACC2OMP_ROCTX=1] \
+  bash -lc 'qa/afar_app/build_afar_hip.sh build_afar244_hip_fold'          # 乾淨樹 ~4 分鐘
+# 8 GPU tau=1（每個 rank 自動 mask 到自己的卡；~39 s wall）
+cd ~/CWA/GEPS/job && env -i HOME=$HOME USER=$USER PATH=/usr/local/bin:/usr/bin:/bin TERM=dumb \
+  GEPS_MPI_ARGS="--map-by ppr:4:numa:PE=16 --bind-to core" \
+  GEPS_LIB_ROOT=$HOME/CWA/h7bm_geps/GEPS_LIB_afar244 GEPS_DMSDB=$HOME/CWA/geps_run/dmsdb GEPS_DTG=25010100 \
+  GEPS_IC_DIR=$HOME/CWA/h7bm_geps/dmsdb/TCo383L72.ufs/TCo383l72_25010100 \
+  GEPS_ROCM_BUILD_DIR=build_afar244_hip_fold GEPS_FFT_PLAN_SETS=8 bash ./TCo383L72_IC_sample_rocm_8gpu > log 2>&1
+#   2 GPU：同上換 TCo383L72_IC_sample_rocm_2gpu（不要 GEPS_MPI_ARGS）；1 GPU：TCo383L72_IC_sample_rocm
+# profile：加 OMP_TOOL=disabled GEPS_PROF_WRAP="/opt/afar-24.4.0/bin/rocprofv3 --kernel-trace --marker-trace -f csv -d $P -o r_%pid% --"
+#   不要加 --memory-copy-trace（rocprofiler 隨機 SIGSEGV，§6 第 21 層）。每步時間取 marker 'step' 範圍（intgrt_gpu 內）的第 3–6 步。
+#   分析腳本（不在 repo）：~/CWA/geps_run/prof_2gpu_roctx/analyze.py <dir>（需要 memory_copy_trace.csv）、~/CWA/geps_run/compare_prof.py
+# 新開關：GEPS_RANK_GPU_MASK=0（不 mask）、GEPS_ROCTX=0（執行期關 ROCTx）、GEPS_ACC2OMP_SPMD_WHY=1（建置時印沒折的迴圈與原因）、
+#         GEPS_MPI_ARGS（mpiexec 參數）、GEPS_DTG / GEPS_IC_DIR（分析時間與 IC 目錄；預設 22081500）、HSA_XNACK（預設 1）
+# 驗證：9 個 ' bal= ' 與 6 個 'tend rms(GPU) = ' 與 ~/CWA/geps_run/logs/afar244_8gpu_run1.log 逐位元相同（2 GPU 與 8 GPU 的值相同）
+```
+
+```bash
 # 判斷跑成功：log 尾巴要看到這兩行
 #   tau=    1.000,     Timing= ...
 #   PROGRAM CWBGFS HAS ENDED.
@@ -4130,6 +4210,7 @@ unset GH_PAT        # 用完到 GitHub revoke
 # 坑 2：repo 的 pre-push / post-commit hook 需要 git-lfs（fix/*.f77、*.dat 走 LFS）。2026-09-18 已裝 git-lfs 3.4.1；
 #        沒裝的話 push 會被 hook 擋，只有在 commit 沒碰 LFS 檔時才可以 git push --no-verify 繞過。
 # 進版控前的檢查：git diff --cached --name-only | grep -i '\.log' 必須是空的（run log 不進 repo）。
+# MI325X 機器（2026-11-20）：origin = git@github.com:PaulMullowney/GEPS.git（fork，SSH key 已設好），直接 git push origin feature/multi-compiler。
 ```
 
 ---
@@ -4158,6 +4239,13 @@ unset GH_PAT        # 用完到 GitHub revoke
    `4GB` 與預設相同。
 
 7. ~~查 `NaN` 的來源~~ ✅ **已查明（2026-09-11）= 第 7 層**：GPU 的 NNMI 是完全的 no-op（`bal` 精確為 0、`pt` 逐位元不變），因為 graph capture 區塊內的 OpenMP kernel 不在被 capture 的 stream 上——錄製期搶先執行讀到空 `wrk`，又沒被錄進 graph。**與第 6 層同源。** 詳見 §6「第 7 層」。
+8g. **速度（2026-11-20，8 × MI325X，0.356 s/步 vs A100 0.34）**：剩下的（profile 每步 386 ms，依大小）：
+   (i) `mp_scheme_gpu` 65 ms（`fall_flux` 32 ms 是 grid 已滿的 kernel，要看 kernel 本身）；
+   (ii) rocFFT ~55 ms／7,900 次 launch：同長度緯度合成 batched plan，或 pad 到不用 Bluestein 的長度；
+   (iii) kernel 間空檔 ~50 ms：把更多步驟收進 HIP graph（像 `*_cuda_graph` 的轉換常式）；
+   (iv) `src/rocm/cyclic_cell_ppm_gpu.f90` 找格子迴圈 22 ms（6,912 thread 各自序列走一整列；改成平行搜尋＋`max` reduction 是精確的）；
+   (v) RCCL 26 ms；(vi) `GEPS_ACC2OMP_SPMD_WHY=1` 列出的其餘候選（moninedmf、samf*、gwdps 多半是「內層指令前有非 scalar 敘述」）。
+   另：A100 的 0.34 s 只有一份 log，在 NVIDIA 上重量一次再當目標；`HSA_XNACK=0` 不帶 profiler 確認後可改預設（§5.1）。
 8f. **速度（2026-09-18）**：探針已拆（無影響）；每步 740 → 11.8 s（見 §6 末的逐項）。下一步依序：(i) ~~1-GPU（NPEY=1）路徑跑通 tau=1~~ ✅ 2026-11-20（§6 第 19 層）；(ii) 水平平流 `cyclic_cell_ppm` 6 個 kernel 合併／tracer 維度 collapse；(iii) 譜轉換逐 mf 小 kernel 合併；(iv) `geps_acc_wait_all`（device 級）改 stream 級；(v) 上游回報清單。量測工具都在：`GEPS_ACC2OMP_TIMERS=1`（build 時）印每步各常式秒數、`GEPS_PROF_WRAP` 接 rocprofv3、`qa/tools/sample_bt2.sh` 取 host backtrace。
 8e. **✅ 2026-09-17 18:55：GPU 六步與 CPU 對到 1e-11**（深對流 `val1/val2` 修好）。優先序不變：拆探針＋量速度 → 1-GPU → 上游回報（新增：`samfdeepcnv_kh_gpu` 34 vs 29 個引數；`val1/val2`、`snoexp` 等 private-未初始化清單）。
 8d. **✅ 2026-09-17 05:00：GPU 已能完整跑完 tau=1**（第 17 層 raw RCCL 等待、第 18 層 `LIBOMPTARGET_STACK_SIZE` + `adjptqintp` guard）。**現在的優先序**：
@@ -4220,4 +4308,4 @@ unset GH_PAT        # 用完到 GitHub revoke
    - §6 的第 1-3 層是已修好的歷史；第 4 層、第 5 層兩節保留的是推理過程，**結論都在「第 5 層根因」那一節**，時間不夠就只讀它
 2. §4（懂 acc2omp + src/rocm 的設計，這是整個移植的骨架）
 3. §7 規矩（避免重蹈覆轍）
-4. 動手前先跑 `git status` 和 `git log --oneline -3` 確認工作樹還是不是本文件描述的樣子（2026-09-18 基準：乾淨，HEAD = `4424cf83`）
+4. 動手前先跑 `git status` 和 `git log --oneline -3` 確認工作樹還是不是本文件描述的樣子（2026-09-18 基準：乾淨，HEAD = `4424cf83`；2026-11-20 MI325X 基準：乾淨，HEAD = 本文件這次更新的 commit，在 `PaulMullowney/GEPS` 的 `feature/multi-compiler`）
