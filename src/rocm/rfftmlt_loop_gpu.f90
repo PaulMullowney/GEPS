@@ -58,12 +58,18 @@ subroutine rfftmlt_loop_identical_cuda_graph(cc, gwk1, trigsj, ifaxj, jlist1, nx
    ! ~31k rocFFT kernel launches per step, GPU 30% busy in this phase), so the
    ! latitudes are issued from GEPS_FFT_THREADS host threads (default 4), each
    ! on its own non-blocking stream; every plan has its own work area
-   ! (auto-allocation on), so plans never share state. Same kernels, same
-   ! data, same order per plan -> bit-identical.
+   ! (auto-allocation on). Same kernels, same data, same order per plan ->
+   ! bit-identical.
+   ! A plan is shared by every latitude of the same length: on 1 rank both
+   ! hemispheres' latitudes (j, latf+1-j) are local, so each plan serves two
+   ! latitudes. A rocFFT plan (stream, work area) must not execute on two
+   ! threads at once, so each plan is owned by one thread and all of its
+   ! latitudes run there.
    integer, parameter :: MAXTHR = 16
    integer, save :: nthr = -1
    integer(kind=cuda_stream_kind), save :: thr_stream(MAXTHR)
-   integer :: it, dev
+   integer :: it, dev, nown
+   integer :: jj_owner(jlistnum), nxj_owner(0:NMAX)
    interface
       function geps_hip_set_device(id) bind(C, name="geps_hip_set_device")
          import c_int
@@ -149,6 +155,18 @@ subroutine rfftmlt_loop_identical_cuda_graph(cc, gwk1, trigsj, ifaxj, jlist1, nx
    if (ncreated .gt. 0) print *, '[rfftmlt_loop rocm] new plans:', ncreated, &
       ' (jump,m,isign)=', jump, m, isign, ' sets live=', nsets
 
+   ! round-robin over plans in first-use order; within a set nxj identifies the plan
+   nxj_owner = 0
+   nown = 0
+   do jj = 1, jlistnum
+      nxj = nxdef(jlist1(jj))
+      if (nxj_owner(nxj) .eq. 0) then
+         nxj_owner(nxj) = mod(nown, nthr) + 1
+         nown = nown + 1
+      end if
+      jj_owner(jj) = nxj_owner(nxj)
+   end do
+
    if (mod(jump, 2) .ne. 0) then
       print *, 'fft jump is odd, CWB obsoleted, jump=', jump
       return
@@ -162,8 +180,8 @@ subroutine rfftmlt_loop_identical_cuda_graph(cc, gwk1, trigsj, ifaxj, jlist1, nx
    it = omp_get_thread_num() + 1
    ! HIP's current device is per host thread; rank r runs on device r
    if (it .gt. 1) istat = geps_hip_set_device(dev)
-   !$omp do schedule(static)
    do jj = 1, jlistnum
+      if (jj_owner(jj) .ne. it) cycle
       istat = cufftSetStream(plan_jj(jj), thr_stream(it))
       if (isign .eq. 1) then
 #ifdef SP
@@ -180,7 +198,6 @@ subroutine rfftmlt_loop_identical_cuda_graph(cc, gwk1, trigsj, ifaxj, jlist1, nx
       end if
       if (istat .ne. 0) print *, '[rfftmlt_loop rocm] hipfftExec failed', istat, ' jj=', jj
    end do
-   !$omp end do
    !$omp end parallel
    !$omp end target data
    do it = 1, nthr

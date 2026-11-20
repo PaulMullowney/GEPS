@@ -9,6 +9,7 @@
 
 | 項目 | 狀態 |
 |---|---|
+| **2026-11-20（MI325X，afar 24.3.0）** | ✅ **1-GPU（NPEY=1）路徑首次跑完 tau=1**，NNMI 三輪 `bal` 與 6 個 `sptend` 和 2 GPU 逐位元相同（2025-01-01 資料，5.3 s/步）。根因：單 rank 時同長度的南北兩條緯度共用一個 rocFFT plan，被兩個 FFT host thread 同時執行（§6 第 19 層）；修在 `src/rocm/rfftmlt_loop_gpu.f90`，2 GPU 結果不變。 |
 | ROCm CPU build (`build_rocm_cpu`, amdflang host-only OpenMP) | ✅ 可編、**可完整跑完 1 小時預報**（2026-08-27 01:52 的 log 有 `PROGRAM CWBGFS HAS ENDED`） |
 | ROCm GPU build (`build_rocm_hip`, OpenMP target offload + HIP) | ✅ 可編；✅ **2026-09-10 首次跑完全部 3 輪 NNMI 並進入預報積分**（換成 2 張實體 MI300X / SPX 之後）；❌ 但**數值是錯的**：`iteration=2` 起 VRAM 耗盡，垂直平流輸入 `dd` 全為零，積分第一步就 `surf pres tend rms(GPU) = NaN`，最後仍以 `HSA_STATUS_ERROR_OUT_OF_RESOURCES` 中止 |
 | **2026-10-02 最新狀態** | ✅ **7.2.2 正式環境 2.21 s/步**（2 × MI300X，第 3–6 步；CPU 32 核 10.5 s ⇒ 快 4.75 倍）：#14 `HSA_ENABLE_SDMA=0`（regression.ksh 預設）＋#15 `src/nvidia/sflx_gpu.f90` 工作陣列 `dimension(nsold)`，六步與 24 小時 `sptend` 皆逐位元相同；**24 小時預報（144 步）跑完**：中位 2.28 s、積分 416 s、VRAM 峰值 176.9/192 GiB。AMD afar 24.3.0 已評估完（24 h 432 s，需要 hsa_front＋rocFFT 快取＋快取 48 GB，維持 7.2.2）；AMD 回覆草稿 `qa/rocm_toolchain_poc/AFAR_reply_zh.md` 尚未寄出。權威數字：`ROCM_OPTIMIZATION_REPORT.md`；細節 §9 (iv-b)。 |
@@ -3936,6 +3937,40 @@ CPU smoke 只要 5 分鐘、可以反覆跑；
 搜尋範圍從整條 NNMI 鏈縮到單一個 kernel。
 **以後遇到數值不符，第一件事就是讓 CPU 版吐出同樣的量。**
 
+#### ★★★ 第 19 層（2026-11-20，已修好）：1 rank 時兩條緯度共用一個 rocFFT plan，被兩個 host thread 同時執行
+
+**症狀**（MI325X 256 GB、afar 24.3.0、`job/TCo383L72_IC_sample_rocm`＝1 rank、2025-01-01 資料）：每次跑結果都不同。
+NNMI 第 1 輪 `bal` 有時正確（1.999612288630948E-05）、有時 6.89 或 1200；第 2 輪 NaN／2508／6.26；
+最後 `HSA_STATUS_ERROR_MEMORY_FAULT`（`cyclic_cell_ppm_intp_two_loops_gpu`）或 `def_cfl` 3.9e4 中止。
+同一 binary 的 2 GPU（`_2gpu`，NPEY=2）三輪 NNMI 與 6 步都正常。
+
+**根因**：第 13 層之後 `src/rocm/rfftmlt_loop_gpu.f90` 在每個 (jump, m, isign) set 內「每個 `nxj` 一個 plan」。
+TCo 南北對稱，緯度 `j` 與 `latf+1-j` 同長；`make_list.f90` 以 cyclic 分配緯度，兩者奇偶相反：
+- NPEY=2：一對緯度落在不同 rank，rank 內每個 plan 只服務一條緯度（log：每 rank 384 條、384 個 plan）。
+- NPEY=1：768 條緯度、384 個 plan，每個 plan 服務兩條。exec 迴圈的 `!$omp do schedule(static)` 把 768 條切成 4 段 192，
+  `jj` 與 `769-jj` 必落在不同 thread ⇒ 同一 plan（同一 work area，`cufftSetStream` 也互相覆寫）被同時執行。
+
+原註解「every plan has its own work area, so plans never share state」只在 NPEY≥2 成立。
+
+**排除過程**（1 GPU，每次只改一個變數；log 在 `~/CWA/geps_run/logs/`，不在 repo）：
+
+| 變數 | 結果 | 推論 |
+|---|---|---|
+| `HIP_LAUNCH_BLOCKING=1` | 仍錯（第 1 輪 1200） | 不是 HIP stream 之間的順序 |
+| `GEPS_HSA_POOL=0` | 仍錯（第 2 輪 6.26） | 不是配置快取重用 |
+| `LIBOMPTARGET_HEAP_SIZE`＝32 GiB | 仍錯（第 2 輪 2.2e-2） | 不是 device heap 不足 |
+| `GEPS_FFT_THREADS=1`（兩次） | 兩次都與 2 GPU 逐位元相同、tau=1 跑完 | FFT 的 host thread 並行 |
+
+`mpe2d_transpose_ndsl_*` 的 `nsizex==1` 捷徑（`aout` 的 padding 不清零）也排除：`_2gpu` 是 NPEX=1，同樣走捷徑。
+
+**修法**（只動 `src/rocm/`）：每個 plan 指定一個 owner thread（依第一次使用的順序 round-robin），用到該 plan 的緯度都在那個 thread 執行。
+不能用 `mod(nxj, nthr)` 分配：TCo 的 `nxj` 全是 4 的倍數，會全部落在同一個 thread。
+
+**驗證**（`build_afar_hip` 從頭重建）：1 GPU、4 thread 跑三次，NNMI 三輪 `bal`／`pt` 與 6 個 `sptend` 都和 2 GPU 逐位元相同；
+2 GPU 修前修後逐位元相同（1.54–1.61 vs 1.61–1.65 s/步）。1 GPU 每步 5.3 s，FFT thread 1 與 4 一樣快。
+
+**教訓**：改變 rank 數會改變 rank 內資料的組成（這裡是南北對稱的緯度同時在本地），共用資源（plan、work area）的假設要跟著重新檢查。
+
 #### 其他備忘
 - 工作樹裡 `eigen.f90`/`eigenlib.f90`/`eigrs.f90`/`initial.f90`/`mpe_init.f90`/`mpe_unify.f90` 的 `! #region agent log` 除錯探針，**經確認是給 CPU 路徑的 amdflang -O3 spill bug 用的（見上面已繞過的問題 1），跟這整段 GPU omptarget 崩潰無關**（GPU build 走的是 `initial_gpu.f90` 等 `src/nvidia/` 檔案，不是那些有探針的 CPU 檔案）。
 - `src/` 裡的這些 `! #region agent log` 探針（寫 NDJSON 到 `.cursor/debug-*.log`，其中一個已 49 MB）在 GPU port 收斂前可以獨立清掉，不影響 GPU 除錯。
@@ -4123,13 +4158,13 @@ unset GH_PAT        # 用完到 GitHub revoke
    `4GB` 與預設相同。
 
 7. ~~查 `NaN` 的來源~~ ✅ **已查明（2026-09-11）= 第 7 層**：GPU 的 NNMI 是完全的 no-op（`bal` 精確為 0、`pt` 逐位元不變），因為 graph capture 區塊內的 OpenMP kernel 不在被 capture 的 stream 上——錄製期搶先執行讀到空 `wrk`，又沒被錄進 graph。**與第 6 層同源。** 詳見 §6「第 7 層」。
-8f. **速度（2026-09-18）**：探針已拆（無影響）；每步 740 → 11.8 s（見 §6 末的逐項）。下一步依序：(i) 1-GPU（NPEY=1）路徑跑通 tau=1；(ii) 水平平流 `cyclic_cell_ppm` 6 個 kernel 合併／tracer 維度 collapse；(iii) 譜轉換逐 mf 小 kernel 合併；(iv) `geps_acc_wait_all`（device 級）改 stream 級；(v) 上游回報清單。量測工具都在：`GEPS_ACC2OMP_TIMERS=1`（build 時）印每步各常式秒數、`GEPS_PROF_WRAP` 接 rocprofv3、`qa/tools/sample_bt2.sh` 取 host backtrace。
+8f. **速度（2026-09-18）**：探針已拆（無影響）；每步 740 → 11.8 s（見 §6 末的逐項）。下一步依序：(i) ~~1-GPU（NPEY=1）路徑跑通 tau=1~~ ✅ 2026-11-20（§6 第 19 層）；(ii) 水平平流 `cyclic_cell_ppm` 6 個 kernel 合併／tracer 維度 collapse；(iii) 譜轉換逐 mf 小 kernel 合併；(iv) `geps_acc_wait_all`（device 級）改 stream 級；(v) 上游回報清單。量測工具都在：`GEPS_ACC2OMP_TIMERS=1`（build 時）印每步各常式秒數、`GEPS_PROF_WRAP` 接 rocprofv3、`qa/tools/sample_bt2.sh` 取 host backtrace。
 8e. **✅ 2026-09-17 18:55：GPU 六步與 CPU 對到 1e-11**（深對流 `val1/val2` 修好）。優先序不變：拆探針＋量速度 → 1-GPU → 上游回報（新增：`samfdeepcnv_kh_gpu` 34 vs 29 個引數；`val1/val2`、`snoexp` 等 private-未初始化清單）。
 8d. **✅ 2026-09-17 05:00：GPU 已能完整跑完 tau=1**（第 17 層 raw RCCL 等待、第 18 層 `LIBOMPTARGET_STACK_SIZE` + `adjptqintp` guard）。**現在的優先序**：
    (i) **拆探針做乾淨對照**：acc2omp 裡的 DBGMAP/DBGFREE/DBGTRM/DBGHD/DBGMP/DBGSFLX/intgrt_ckpts/diabat_ckpts/pbl_ckpts 全部關掉（建議加一個 `GEPS_ACC2OMP_PROBES=0` 開關，而不是刪碼），
    `src/` 裡的 `! #region agent log` 探針（`intgrt.f90`、`tendget.f90`、`tranrs.f90`、`hdiffu.f90`、`diabat.f90`）也移除，重跑 2-GPU 到 tau=1，確認 6 個 `sptend` 與 l18g 相同、並量真正的每步秒數（NVIDIA 0.34 s）。
    (ii) **量化 GPU 物理 vs CPU 的 4–6%**：用 `p2_*`（兩側已加）先看 `qt`；要追就把 CPU big-loop 的各物理常式輸出改成累加式 Σ² 與 GPU 的 `g_*` 對齊。先確認 NVIDIA 上同樣的檢查點差多少（使用者的 NVIDIA 機器）——若 NVIDIA 也是 4–6%，就不是 ROCm 的問題。
-   (iii) 1 GPU（NPEY=1）也跑一次 tau=1，確認單卡路徑（VRAM 現在 pool 關掉後應該夠）。
+   (iii) 1 GPU（NPEY=1）也跑一次 tau=1，確認單卡路徑（VRAM 現在 pool 關掉後應該夠）。✅ 2026-11-20 在 MI325X 跑通（§6 第 19 層）。
    (iv-a) **✅ 2026-09-21：toolchain 缺陷的獨立 PoC 已整理在 `qa/rocm_toolchain_poc/`**（7 個目錄各附 `run.sh`，`run_all.sh` 全跑約 6 分鐘，`results/` 留有本機量測；README 是給 AMD 的英文報告）：巢狀 reduction 回 0、descriptor 每次 launch 重抄（assumed-shape 17 個 710 µs）、pool 只重用同大小（16 次 31 GB）＋關 pool 後 1 GB alloc/free 21 ms、`hipMemcpy` 對 libomptarget 指標 0.05 GB/s、裝置 I/O 帶進 `__llvm_rpc_client`（延遲效應獨立程式**重現不出**，README 有註明）、runtime 大小 private 陣列 89% 被蓋、`nowait`＋隱式 firstprivate 純量 NYI 編譯錯誤（新發現）。
    (iv-b) **✅ 2026-09-29：AMD 要求用 afar 24.3.0 重測 7 個 PoC ＋ 在 app 上驗證**（英文完整報告：`qa/rocm_toolchain_poc/AFAR_24.3.0_RETEST.md`；PoC log 在 `results_afar/`）。
       - 安裝：`/opt/afar/current`（整包 TheRock SDK：flang 24.0.0git、HIP 7.16、HSA 1.21、自帶 libomptarget/rocFFT/rocBLAS/RCCL）。GEPS_LIB 整包用 afar 重編成 `GEPS_LIB_afar/`（.mod 綁編譯器版本）；app 樹 `build_afar_hip`（`qa/afar_app/build_afar_hip.sh`）。`build_rocm_hip`／`GEPS_LIB` 沒動。安裝過程（下載網址、lbzip2 解壓、gtar/ksh/m4、OpenMPI 與 build_all 指令）：`qa/afar_app/INSTALL_AFAR.md`。
