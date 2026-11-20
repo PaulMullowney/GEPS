@@ -630,10 +630,12 @@ def _vectorise_inner_loops(joined):
     # gets slower (short inner loops under already-collapsed owners) and one
     # of the physics files faults after promotion (not yet bisected); the
     # spectral transforms / hdiffu / mpe2d are where promotion pays off.
-    # 2026-11-20 (afar 24.4.0, 8 GPU): diabat and gwdc promoted - gwdc 22.0 -> 1.8 ms/step,
-    # diabat's own kernels 28.7 -> 12.8, six sptend bit-identical; enabling every physics
-    # file segfaults on the host in getrdy (one of the four listed after mod_ndslfv).
-    default_skip = ("ndslfv,mod_ndslfv,stochastic,prerrtmg,nor_gwdp,gwdps,module_mp,samf,moninedmf,"
+    # 2026-11-20 (afar 24.4.0, 8 GPU): diabat, gwdc, gwdps, nor_gwdp, stochastic promoted -
+    # gwdc 22.0 -> 1.8 ms/step, diabat's own kernels 28.7 -> 12.8, gwdps 5.1 -> 4.1, six
+    # sptend bit-identical. The "faults after promotion" above was rocprofv3
+    # --memory-copy-trace (SIGSEGV in rocprofiler's async_copy_handler, 3 of 4 runs; 0 of 4
+    # without it). prerrtmg stays out: promotion replaces its column-folded kernels.
+    default_skip = ("ndslfv,mod_ndslfv,prerrtmg,module_mp,samf,moninedmf,"
                     "rrtmg,adjptqintp,radsw,mfpbl,ozphys,prexp,mp_scheme,lightning,dcyc2")
     skip = [x for x in os.environ.get("GEPS_ACC2OMP_VECTORISE_SKIP", default_skip).split(",") if x]
     if skip and any(x in _CURRENT_FILE for x in skip):
@@ -795,9 +797,41 @@ _SPMD_EXT = {
     "ozphys_2015": "ix", "gwdc": "ix", "adjptqintp": "nxp",
     "module_mp_gsfcgce": "ite", "diabat_gpu": "nxp", "gwdps": "ix", "nor_gwdp": "nx",
     "rrtmg_gpu": "nx", "dcyc2": "ix", "lightning": "klon",
+    "mp_scheme_gpu": "nx", "prexp_hybrid": "nxp",
 }
 SPMD = os.environ.get("GEPS_ACC2OMP_SPMD", "1") == "1"
 _SPMD_SKIP = [x for x in os.environ.get("GEPS_ACC2OMP_SPMD_SKIP", "").split(",") if x]
+
+_SPMD_WHY = os.environ.get("GEPS_ACC2OMP_SPMD_WHY", "0") == "1"
+_IF_THEN = re.compile(r"^\s*if\s*\((.*)\)\s*then\s*$", re.IGNORECASE)
+
+
+def _lhs_name(code):
+    """Name assigned by a statement (scalar or array element), else None;
+    a one-line `if (...) stmt` is looked through."""
+    s = code.split("!")[0].strip()
+    m = re.match(r"^if\s*\(", s, re.IGNORECASE)
+    if m:
+        depth, k = 1, m.end()
+        while k < len(s) and depth:
+            depth += {"(": 1, ")": -1}.get(s[k], 0)
+            k += 1
+        s = s[k:].strip()
+    m = re.match(r"^([A-Za-z_]\w*)\s*", s)
+    if not m or re.match(r"^(if|do|call|where|select|end|else|return|go\s*to)\b", s, re.IGNORECASE):
+        return None
+    k = m.end()
+    if k < len(s) and s[k] == "(":
+        depth = 1; k += 1
+        while k < len(s) and depth:
+            depth += {"(": 1, ")": -1}.get(s[k], 0)
+            k += 1
+        while k < len(s) and s[k] == " ":
+            k += 1
+    if k < len(s) and s[k] == "=" and s[k + 1:k + 2] != "=":
+        return m.group(1).lower()
+    return None
+
 
 def _spmd_collapse_inner(joined):
     """`parallel loop collapse(2)` over (jj, k) with the OpenACC `loop vector`
@@ -809,8 +843,15 @@ def _spmd_collapse_inner(joined):
     directive is dropped, the DO runs over the file's extent (_SPMD_EXT) with
     the original bound as a guard, so every (jj, k, i) is one work-item. The
     body stays identical and each column's arithmetic is unchanged ->
-    bit-identical. Only perfectly nested triples are touched; loops with
-    `seq`, `reduction(` or `gang` are left alone."""
+    bit-identical. Loops with `seq`, `reduction(` or `gang` are left alone.
+
+    2026-11-20: also folded (each column still runs the same statements in the
+    same order): deeper `loop` directives in the column body (serial there
+    anyway); the column loop inside `if (c) then ... [else ...] end if`, one
+    column loop per branch, with `c` and the scalar prefixes evaluated per
+    column (refused if the column body writes anything they read); a column
+    directive duplicated across `#if/#else/#endif`. GEPS_ACC2OMP_SPMD_WHY=1
+    prints why a candidate was left alone."""
     if not SPMD:
         return joined
     ext = None
@@ -821,115 +862,231 @@ def _spmd_collapse_inner(joined):
         return joined
     out = []
     n = len(joined)
-    i = 0
     n_done = 0
+
+    def why(i, msg):
+        if _SPMD_WHY:
+            sys.stderr.write(f"[acc2omp] spmd skip {_CURRENT_FILE}:{i + 1}: {msg}\n")
+
+    def nxt(j, cpp_ok=True):
+        while j < n and not joined[j][1]:
+            c = joined[j][0].strip()
+            if c and not c.startswith("!") and not (cpp_ok and c.startswith("#")):
+                break
+            j += 1
+        return j
+
+    def is_assign(j):
+        return (not joined[j][1] and re.match(r"^\s*[A-Za-z_]\w*\s*=(?!=)", joined[j][0])
+                and not re.match(r"^\s*(if|do|call|where|select)\b", joined[j][0].strip(), re.IGNORECASE))
+
+    def inner_ok(j):
+        r = _acc_rest(joined[j][0]).lower()
+        return (r.startswith("loop") and not re.search(r"\bseq\b", r) and "reduction(" not in r.replace(" ", "")
+                and "gang" not in r and "collapse" not in r)
+
+    def column_loop(j):
+        """inner directive (or #if/#else/#endif pair of them) at j, then its DO.
+        -> (first, last, d3, e3, ivar, lo, hi) or a reason string."""
+        first = j
+        prev = j - 1
+        while prev > 0 and not joined[prev][1] and not joined[prev][0].strip():
+            prev -= 1
+        if not joined[j][1] or not inner_ok(j):
+            return "inner directive is not a plain loop vector"
+        last = j
+        if _CPP_OPEN.match(joined[prev][0].strip()) and not joined[prev][1]:
+            e = nxt(j + 1, cpp_ok=False)
+            if not (e < n and re.match(r"^\s*#\s*else\b", joined[e][0])):
+                return "#if around the inner directive without #else"
+            a2 = nxt(e + 1, cpp_ok=False)
+            if not (a2 < n and joined[a2][1] and inner_ok(a2)):
+                return "#else branch is not a plain loop vector"
+            en = nxt(a2 + 1, cpp_ok=False)
+            if not (en < n and _CPP_CLOSE.match(joined[en][0])):
+                return "#if group around the inner directive has more than two branches"
+            first, last = prev, en
+        d3 = nxt(last + 1, cpp_ok=False)
+        if d3 >= n or joined[d3][1] or not _do_start(joined[d3][0].strip())[0]:
+            return "no DO after the inner directive"
+        m3 = re.match(r"^(\s*)do\s+([A-Za-z_]\w*)\s*=\s*([^,]+),\s*([^,]+?)\s*(,\s*[^,]+)?\s*$", joined[d3][0], re.IGNORECASE)
+        if not m3 or m3.group(5):
+            return "column DO has a stride or an unparsed bound"
+        e3 = _nest_end(joined, d3)
+        for q in range(d3 + 1, e3):
+            if joined[q][1]:
+                r = _acc_rest(joined[q][0]).lower()
+                if not r.startswith("loop") or "gang" in r:
+                    return f"acc directive in the column body: {r[:40]}"
+            elif _CPP_OPEN.match(joined[q][0].strip()):
+                pass
+        return (first, last, d3, e3, m3.group(2), m3.group(3).strip(), m3.group(4).strip())
+
+    def only_comments(a, b):
+        for q in range(a + 1, b):
+            if joined[q][1] or (joined[q][0].strip() and not joined[q][0].strip().startswith("!")):
+                return False
+        return True
+
+    def attempt(i):
+        line = joined[i][0]
+        low = _acc_rest(line).lower()
+        mcol = re.search(r"\bcollapse\s*\(\s*(\d+)\s*\)", low)
+        ncol = int(mcol.group(1)) if mcol else 1
+        d1 = nxt(i + 1)
+        if d1 >= n or joined[d1][1] or not _do_start(joined[d1][0].strip())[0]:
+            return "no DO after the owner"
+        d2 = d1
+        if ncol == 2:
+            d2 = nxt(d1 + 1)
+            if d2 >= n or joined[d2][1] or not _do_start(joined[d2][0].strip())[0]:
+                return "collapse(2) without a second DO"
+        if any(_CPP_OPEN.match(joined[q][0].strip()) for q in range(i + 1, d2 + 1) if not joined[q][1]):
+            return "cpp between the owner DOs"
+        v1 = re.match(r"^\s*do\s+([A-Za-z_]\w*)", joined[d1][0], re.IGNORECASE).group(1).lower()
+        v2 = re.match(r"^\s*do\s+([A-Za-z_]\w*)", joined[d2][0], re.IGNORECASE).group(1).lower()
+        e2 = _nest_end(joined, d2)
+        e1 = _nest_end(joined, d1)
+        if ncol == 2 and not only_comments(e2, e1):
+            return "owner DOs not perfectly nested"
+        # prefix scalars, optional `if (c) then` + more prefix scalars
+        prefix = []
+        j = nxt(d2 + 1, cpp_ok=False)
+        while j < e2 and is_assign(j):
+            prefix.append(j); j = nxt(j + 1, cpp_ok=False)
+        cond = None
+        prefix2 = []
+        if j < e2 and not joined[j][1] and _IF_THEN.match(joined[j][0]):
+            cond = j
+            j = nxt(j + 1, cpp_ok=False)
+            while j < e2 and is_assign(j):
+                prefix2.append(j); j = nxt(j + 1, cpp_ok=False)
+        # the directive may sit after an #if line
+        if j < e2 and not joined[j][1] and _CPP_OPEN.match(joined[j][0].strip()):
+            j = nxt(j + 1, cpp_ok=False)
+        if j >= e2 or not joined[j][1]:
+            return "no inner directive right after the owner DOs / prefix"
+        col = column_loop(j)
+        if isinstance(col, str):
+            return col
+        branches = [(prefix2, col)]
+        after = nxt(col[3] + 1, cpp_ok=False)
+        if cond is not None:
+            if after < e2 and re.match(r"^\s*else\s*$", joined[after][0], re.IGNORECASE):
+                prefix3 = []
+                j = nxt(after + 1, cpp_ok=False)
+                while j < e2 and is_assign(j):
+                    prefix3.append(j); j = nxt(j + 1, cpp_ok=False)
+                if j >= e2 or not joined[j][1]:
+                    return "else branch has no inner directive"
+                col2 = column_loop(j)
+                if isinstance(col2, str):
+                    return "else branch: " + col2
+                if col2[4].lower() != col[4].lower() or col2[5] != col[5]:
+                    return "if/else column loops differ in variable or lower bound"
+                branches.append((prefix3, col2))
+                after = nxt(col2[3] + 1, cpp_ok=False)
+            if not (after < e2 and re.match(r"^\s*end\s*if\b", joined[after][0], re.IGNORECASE)):
+                return "statements after the column loop inside the if"
+            if_end = after
+            if not only_comments(if_end, e2):
+                return "statements after the if block"
+        elif not only_comments(col[3], e2):
+            return "statements after the column loop"
+        ivar, lo = col[4], col[5]
+        # what the scalars and the condition read must not be written by any column
+        body_lhs = set()
+        for _, c in branches:
+            for q in range(c[2] + 1, c[3]):
+                if not joined[q][1]:
+                    nm = _lhs_name(joined[q][0])
+                    if nm:
+                        body_lhs.add(nm)
+        pre_all = prefix + [q for p, _ in branches for q in p]
+        pre_names = set(re.match(r"^\s*([A-Za-z_]\w*)", joined[q][0]).group(1).lower() for q in pre_all)
+        if pre_names & body_lhs:
+            return f"column body reassigns a prefix scalar {sorted(pre_names & body_lhs)}"
+        reads = set()
+        for q in pre_all:
+            reads |= set(t.lower() for t in re.findall(r"[A-Za-z_]\w*", joined[q][0].split("=", 1)[1]))
+        if cond is not None:
+            reads |= set(t.lower() for t in re.findall(r"[A-Za-z_]\w*", _IF_THEN.match(joined[cond][0]).group(1)))
+        if ivar.lower() in reads:
+            return "prefix or condition reads the column variable"
+        if reads & body_lhs:
+            return f"column body writes what the prefix/condition reads {sorted(reads & body_lhs)}"
+        guarded = False
+        for _, c in branches:
+            hi_toks = set(t.lower() for t in re.findall(r"[A-Za-z_]\w*", c[6]))
+            if hi_toks & ({v1, v2} | pre_names) or cond is not None and c[6] != branches[0][1][6]:
+                guarded = True
+        if cond is not None and len(branches) == 2 and branches[0][1][6] != branches[1][1][6]:
+            guarded = True
+        # private(): prefix scalars become per work-item
+        new_owner = line
+        if mcol:
+            new_owner = re.sub(r"\bcollapse\s*\(\s*\d+\s*\)", f"collapse({ncol + 1})", new_owner, count=1, flags=re.IGNORECASE)
+        else:
+            new_owner = new_owner.rstrip() + f" collapse({ncol + 1})"
+        have = _clause_names(_acc_rest(new_owner))
+        missing = [nm for nm in sorted(pre_names) if nm not in have]
+        if missing:
+            new_owner = new_owner.rstrip() + " private(" + ", ".join(missing) + ")"
+        res = [(new_owner, True)]
+        for q in range(i + 1, d2 + 1):
+            res.append(joined[q])
+        moved = set(pre_all) | ({cond} if cond is not None else set())
+        for _, c in branches:
+            moved |= set(range(c[0], c[1] + 1))
+        first_moved = min(moved)
+        for q in range(d2 + 1, first_moved):
+            res.append(joined[q])
+        ind3 = re.match(r"^(\s*)", joined[col[2]][0]).group(1)
+        res.append((f"{ind3}! acc2omp: column loop folded into collapse({ncol + 1})", False))
+        hi0 = col[6]
+        res.append((f"{ind3}do {ivar} = {lo}, {ext if guarded else hi0}", False))
+        for q in prefix:
+            res.append((f"{ind3}   {joined[q][0].strip()}", False))
+        if cond is not None:
+            res.append((f"{ind3}   {joined[cond][0].strip()}", False))
+        for bi, (pre, c) in enumerate(branches):
+            if bi == 1:
+                res.append((f"{ind3}   else", False))
+            for q in pre:
+                res.append((f"{ind3}   {joined[q][0].strip()}", False))
+            if guarded:
+                res.append((f"{ind3}   if ({ivar} .le. {c[6]}) then", False))
+            for q in range(c[2] + 1, c[3]):
+                res.append(joined[q])
+            if guarded:
+                res.append((f"{ind3}   end if", False))
+        if cond is not None:
+            res.append((f"{ind3}   end if", False))
+        res.append((f"{ind3}end do", False))
+        last_moved = if_end if cond is not None else col[3]
+        for q in range(last_moved + 1, e1 + 1):
+            res.append(joined[q])
+        return res, e1
+
+    i = 0
     while i < n:
         line, is_acc = joined[i]
         if not is_acc:
             out.append(joined[i]); i += 1; continue
-        rest = _acc_rest(line)
-        low = rest.lower()
+        low = _acc_rest(line).lower()
         mcol = re.search(r"\bcollapse\s*\(\s*(\d+)\s*\)", low)
         ncol = int(mcol.group(1)) if mcol else 1
         if not low.startswith("parallel loop") or line.rstrip().endswith("&") or ncol not in (1, 2):
             out.append(joined[i]); i += 1; continue
-        # outer nest: ncol DOs, optional scalar-assignment prefix (e.g.
-        # `j = jlist1(jj); nxj = nxdef_2d(j)`), the inner acc loop, its DO
-        j = i + 1
-        def _skip(j):
-            while j < n and (not joined[j][0].strip() or joined[j][0].strip().startswith(("!", "#"))) and not joined[j][1]:
-                j += 1
-            return j
-        j = _skip(j)
-        if j >= n or joined[j][1] or not _do_start(joined[j][0].strip())[0]:
+        r = attempt(i)
+        if isinstance(r, str):
+            # only report owners that have an inner loop directive at all
+            e = _nest_end(joined, nxt(i + 1)) if nxt(i + 1) < n and _do_start(joined[nxt(i + 1)][0].strip())[0] else i
+            if any(joined[q][1] and _acc_rest(joined[q][0]).lower().startswith("loop") for q in range(i + 1, e)):
+                why(i, r)
             out.append(joined[i]); i += 1; continue
-        d1 = j
-        if ncol == 2:
-            j = _skip(j + 1)
-            if j >= n or joined[j][1] or not _do_start(joined[j][0].strip())[0]:
-                out.append(joined[i]); i += 1; continue
-            d2 = j
-        else:
-            d2 = d1
-        # prefix: plain scalar assignments only (no parentheses on the LHS,
-        # no calls); they are replicated inside the collapsed loop
-        prefix = []
-        j = _skip(j + 1)
-        while j < n and not joined[j][1] and re.match(r"^\s*[A-Za-z_]\w*\s*=(?!=)", joined[j][0]) \
-                and not re.match(r"^\s*(if|do|call|where|select)\b", joined[j][0].strip(), re.IGNORECASE):
-            prefix.append(joined[j][0])
-            j = _skip(j + 1)
-        if j >= n or not joined[j][1]:
-            out.append(joined[i]); i += 1; continue
-        inner_dir = j
-        r = _acc_rest(joined[j][0]).lower()
-        if not r.startswith("loop") or re.search(r"\bseq\b", r) or "reduction(" in r.replace(" ", "") or "gang" in r or "collapse" in r:
-            out.append(joined[i]); i += 1; continue
-        j = _skip(j + 1)
-        if j >= n or joined[j][1] or not _do_start(joined[j][0].strip())[0]:
-            out.append(joined[i]); i += 1; continue
-        d3 = j
-        m3 = re.match(r"^(\s*)do\s+([A-Za-z_]\w*)\s*=\s*([^,]+),\s*([^,]+?)\s*(,\s*[^,]+)?\s*$", joined[d3][0], re.IGNORECASE)
-        if not m3 or m3.group(5):
-            out.append(joined[i]); i += 1; continue
-        ind3, ivar, lo, hi = m3.group(1), m3.group(2), m3.group(3).strip(), m3.group(4).strip()
-        v1 = re.match(r"^\s*do\s+([A-Za-z_]\w*)", joined[d1][0], re.IGNORECASE).group(1).lower()
-        v2 = re.match(r"^\s*do\s+([A-Za-z_]\w*)", joined[d2][0], re.IGNORECASE).group(1).lower()
-        e3 = _nest_end(joined, d3)
-        e2 = _nest_end(joined, d2)
-        e1 = _nest_end(joined, d1)
-        # perfect nesting: nothing but comments between end do's
-        def _only_comments(a, b):
-            for q in range(a + 1, b):
-                if joined[q][1] or (joined[q][0].strip() and not joined[q][0].strip().startswith("!")):
-                    return False
-            return True
-        if not (_only_comments(e3, e2) and (ncol == 1 or _only_comments(e2, e1))):
-            out.append(joined[i]); i += 1; continue
-        # any deeper acc directive inside the body? leave it (vectorise territory)
-        if any(joined[q][1] for q in range(d3 + 1, e3)):
-            out.append(joined[i]); i += 1; continue
-        # prefix scalars must not be re-assigned in the body (replication would change them)
-        pre_names = set(re.match(r"^\s*([A-Za-z_]\w*)", pl).group(1).lower() for pl in prefix)
-        body_lhs = set()
-        for q in range(d3 + 1, e3):
-            am = _ASSIGN_RE.match(joined[q][0])
-            if am: body_lhs.add(am.group(1).lower())
-        if pre_names & body_lhs:
-            out.append(joined[i]); i += 1; continue
-        toks = set(t.lower() for t in re.findall(r"[A-Za-z_]\w*", hi)) | set(
-            t.lower() for pl in prefix for t in re.findall(r"[A-Za-z_]\w*", pl.split("=", 1)[0]))
-        hi_toks = set(t.lower() for t in re.findall(r"[A-Za-z_]\w*", hi))
-        guarded = bool(hi_toks & ({v1, v2} | pre_names))
-        newcol = ncol + 1
-        if mcol:
-            new_owner = re.sub(r"\bcollapse\s*\(\s*\d+\s*\)", f"collapse({newcol})", line, count=1, flags=re.IGNORECASE)
-        else:
-            new_owner = line.rstrip() + f" collapse({newcol})"
-        out.append((new_owner, True))
-        for q in range(i + 1, inner_dir):
-            if q >= d2 + 1 and joined[q][0] in prefix:
-                continue          # moved inside the collapsed loop
-            out.append(joined[q])
-        out.append((f"{ind3}! acc2omp: column loop folded into collapse({newcol})", False))
-        for q in range(inner_dir + 1, d3):
-            out.append(joined[q])
-        if guarded:
-            out.append((f"{ind3}do {ivar} = {lo}, {ext}", False))
-            for pl in prefix:
-                out.append((f"{ind3}   {pl.strip()}", False))
-            out.append((f"{ind3}if ({ivar} .le. {hi}) then", False))
-            for q in range(d3 + 1, e3):
-                out.append(joined[q])
-            out.append((f"{ind3}end if", False))
-        else:
-            out.append(joined[d3])
-            for pl in prefix:
-                out.append((f"{ind3}   {pl.strip()}", False))
-            for q in range(d3 + 1, e3):
-                out.append(joined[q])
-        for q in range(e3, e1 + 1):
-            out.append(joined[q])
+        res, e1 = r
+        out.extend(res)
         n_done += 1
         i = e1 + 1
     if n_done:
