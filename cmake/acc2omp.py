@@ -1686,6 +1686,165 @@ def resolve_gpu_ifdefs(lines: list[str]) -> list[str]:
 
 _CURRENT_FILE = ""
 
+ROCTX = [x for x in os.environ.get("GEPS_ACC2OMP_ROCTX", "0").split(",") if x and x != "0"]
+_ROCTX_SKIP_CALLEES = ("geps_", "flush", "system", "exit", "abort", "mpi_", "omp_",
+                       "date_and_time", "cpu_time", "random_", "get_command",
+                       "get_environment", "move_alloc", "execute_command")
+_UNIT_RE = re.compile(r"^\s*((recursive|pure|elemental|module)\s+)*"
+                      r"((real|integer|logical|complex|character|double\s+precision|type)\b[^!'\"]*?\s+)?"
+                      r"(subroutine|function|program)\s+\w+", re.IGNORECASE)
+_END_UNIT_RE = re.compile(r"^\s*end\s*(subroutine|function|program)\b", re.IGNORECASE)
+_OMP_LOOP_WORDS = re.compile(r"\b(do|distribute|loop|simd)\b")
+_OMP_STANDALONE = ("target enter", "target exit", "target update", "barrier", "taskwait",
+                   "flush", "declare", "threadprivate", "requires")
+
+
+def inject_roctx(name: str, lines: list[str]) -> list[str]:
+    """Wrap every host-level `call X` in roctx push/pop (GEPS_ACC2OMP_ROCTX).
+
+    Calls inside device code are left alone: `declare target` units, bare
+    `!$omp target`/`teams`/`parallel` blocks, and the DO nest that follows a
+    loop construct (`target teams distribute parallel do` mostly has no end
+    directive in the translated output)."""
+    if not ROCTX or not (ROCTX == ["1"] or any(x in name for x in ROCTX)):
+        return lines
+    from intgrt_ckpts import _cont
+
+    n = len(lines)
+    device_unit = [False] * n
+    cur = False
+    iface = 0
+    for i, ln in enumerate(lines):
+        st = ln.strip().lower()
+        if re.match(r"^(abstract\s+)?interface\b", st):
+            iface += 1
+        elif re.match(r"^end\s*interface\b", st):
+            iface -= 1
+        elif iface == 0 and _UNIT_RE.match(ln) and not st.startswith("end"):
+            cur = False
+            for j in range(i + 1, n):
+                s2 = lines[j].strip().lower()
+                if (_UNIT_RE.match(lines[j]) and not s2.startswith("end")) or _END_UNIT_RE.match(lines[j]) \
+                        or s2 == "contains":
+                    break
+                if s2.startswith("!$omp declare target"):
+                    cur = True
+                    break
+        device_unit[i] = cur
+
+    out: list[str] = []
+    block = 0            # open bare target/teams/parallel blocks
+    loop_pending = False  # a loop construct was seen; its DO has not started
+    loop_depth = 0       # DO nesting inside the current loop construct
+    loop_labels: list[str] = []
+    unit = ""
+    i = 0
+    while i < n:
+        ln = lines[i]
+        st = ln.strip()
+        low = st.lower()
+        mu = _UNIT_RE.match(ln)
+        if mu and not low.startswith("end"):
+            unit = re.search(r"(subroutine|function|program)\s+(\w+)", low).group(2)
+        if "intgrt_gpu" in name and re.match(r"^\s*if\s*\(\s*itau\s*\.lt\.\s*itaue\s*\)\s*go\s*to\s*100\b", low):
+            out.append("   call geps_roctx_pop()")
+            out.append(ln)
+            i += 1
+            continue
+        if "intgrt_gpu" in name and re.match(r"^100\s+continue\b", low):
+            out.append(ln)
+            out.append("   call geps_roctx_push('step')")
+            i += 1
+            continue
+        if low.startswith("!$omp") and not low.startswith("!$omp&"):
+            d = re.sub(r"^!\$omp\s+", "", low)
+            # host-level data movement: one range per directive, named by its
+            # clauses, so memcpys outside a marked call are attributable
+            if not (device_unit[i] or block or loop_depth or loop_pending) and \
+                    re.match(r"^(end\s+)?target\s+(update|enter\s+data|exit\s+data|data)\b", d):
+                j = i
+                text = d
+                while j + 1 < n and lines[j + 1].strip().lower().startswith("!$omp&"):
+                    j += 1
+                    text += " " + lines[j].strip()[6:].strip().lower()
+                label = re.sub(r"\s+", " ", re.sub(r"^target\s+", "", text).replace("&", " ")).strip()
+                label = (label[:44] + " @" + unit[:24]).replace("'", "")  # 132-column limit
+                ind = re.match(r"^(\s*)", ln).group(1)
+                out.append(f"{ind}call geps_roctx_push('omp {label}')")
+                out.extend(lines[i:j + 1])
+                out.append(f"{ind}call geps_roctx_pop()")
+                i = j + 1
+                continue
+            if d.startswith("end"):
+                rest = d[3:].strip()
+                if not rest.startswith("target data") and not _OMP_LOOP_WORDS.search(rest) \
+                        and rest.startswith(("target", "teams", "parallel")) and block > 0:
+                    block -= 1
+            elif d.startswith(_OMP_STANDALONE) or d.startswith("target data"):
+                pass
+            elif d.startswith(("target", "teams", "parallel")):
+                if _OMP_LOOP_WORDS.search(d.split("(")[0]) and not re.match(r"^parallel\s*$", d):
+                    if block == 0 and loop_depth == 0:
+                        loop_pending = True
+                else:
+                    block += 1
+            out.append(ln)
+            i += 1
+            continue
+        if low.startswith(("!", "#")) or not low:
+            out.append(ln)
+            i += 1
+            continue
+        mdo = re.match(r"^(\d+\s+)?(\w+\s*:\s*)?do\b\s*(\d+)?", low)
+        if mdo and (loop_pending or loop_depth > 0):
+            loop_pending = False
+            loop_depth += 1
+            if mdo.group(3):
+                loop_labels.append(mdo.group(3))
+        elif loop_depth > 0:
+            if re.match(r"^(\d+\s+)?end\s*do\b", low):
+                loop_depth -= 1
+            else:
+                mlab = re.match(r"^(\d+)\s", low)
+                while mlab and loop_labels and loop_labels[-1] == mlab.group(1):
+                    loop_labels.pop()
+                    loop_depth -= 1
+        m = re.match(r"^(\s*)call\s+([A-Za-z0-9_]+)", ln)
+        if not m or device_unit[i] or block or loop_depth or loop_pending \
+                or m.group(2).lower().startswith(_ROCTX_SKIP_CALLEES):
+            out.append(ln)
+            i += 1
+            continue
+        ind, callee = m.group(1), m.group(2).lower()
+        out.append(f"{ind}call geps_roctx_push('{callee}')")
+        out.append(ln)
+        cont = _cont(ln)
+        cpp_open = 0
+        while cont and i + 1 < n:
+            i += 1
+            out.append(lines[i])
+            s2 = lines[i].lstrip()
+            if s2.startswith("!"):
+                continue
+            if s2.startswith("#"):
+                if s2.startswith("#if"):
+                    cpp_open += 1
+                elif s2.startswith("#endif"):
+                    cpp_open -= 1
+                continue
+            cont = _cont(lines[i])
+        while cpp_open > 0 and i + 1 < n:
+            i += 1
+            out.append(lines[i])
+            s2 = lines[i].lstrip()
+            if s2.startswith("#if"):
+                cpp_open += 1
+            elif s2.startswith("#endif"):
+                cpp_open -= 1
+        out.append(f"{ind}call geps_roctx_pop()")
+        i += 1
+    return out
+
 
 def translate_file(src: Path, dst: Path) -> None:
     global _CURRENT_FILE
@@ -1711,6 +1870,7 @@ def translate_file(src: Path, dst: Path) -> None:
     out = relax_intent_in_on_assignment(out)
     out = strip_parameter_maps(out)
     out = _silence_device_io(out)
+    out = inject_roctx(src.name.lower(), out)
     text_out = "\n".join(out) + "\n"
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and dst.read_text(errors="replace") == text_out:

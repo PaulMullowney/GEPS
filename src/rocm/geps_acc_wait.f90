@@ -42,6 +42,29 @@ function geps_hide_myrank_t() result(r)
    r = myrank
 end function geps_hide_myrank_t
 
+! ROCTx range around a host-level call (acc2omp GEPS_ACC2OMP_ROCTX)
+subroutine geps_roctx_push(name)
+  use iso_c_binding, only: c_char, c_null_char
+  implicit none
+  character(len=*), intent(in) :: name
+  interface
+      subroutine geps_roctx_push_c(s) bind(C, name="geps_roctx_push_c")
+      import c_char
+      character(kind=c_char), dimension(*) :: s
+    end subroutine
+  end interface
+  call geps_roctx_push_c(trim(name)//c_null_char)
+end subroutine geps_roctx_push
+
+subroutine geps_roctx_pop()
+  implicit none
+  interface
+      subroutine geps_roctx_pop_c() bind(C, name="geps_roctx_pop_c")
+    end subroutine
+  end interface
+  call geps_roctx_pop_c()
+end subroutine geps_roctx_pop
+
 ! 2026-09-19: turn the shim's per-dgemm stream sync off/on around the Legendre
 ! dgemm loops (acc2omp _defer_graph_loop_syncs); the loop is followed by
 ! geps_acc_wait_all().

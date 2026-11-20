@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <dlfcn.h>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -169,6 +170,41 @@ void geps_dbg_gpu_log_(int *hyp, int *locid, int *rank, long long *p0,
   dbg_ndjson(h, loc, "ckpt", *rank, *p0, *p1, *p2, 1);
 }
 /* #endregion */
+
+/* ROCTx ranges for the acc2omp marker pass (GEPS_ACC2OMP_ROCTX). The library
+   is dlopen'ed so the build needs no ROCTx link; without it (or with
+   GEPS_ROCTX=0) both calls are no-ops. */
+namespace {
+int (*g_roctx_push)(const char *) = nullptr;
+int (*g_roctx_pop)() = nullptr;
+void roctx_load() {
+  const char *e = std::getenv("GEPS_ROCTX");
+  if (e && e[0] == '0')
+    return;
+  void *h = dlopen("librocprofiler-sdk-roctx.so.1", RTLD_NOW | RTLD_GLOBAL);
+  if (!h)
+    h = dlopen("librocprofiler-sdk-roctx.so", RTLD_NOW | RTLD_GLOBAL);
+  if (!h)
+    return;
+  g_roctx_push = (int (*)(const char *))dlsym(h, "roctxRangePushA");
+  g_roctx_pop = (int (*)())dlsym(h, "roctxRangePop");
+  if (!g_roctx_push || !g_roctx_pop)
+    g_roctx_push = nullptr, g_roctx_pop = nullptr;
+}
+std::once_flag g_roctx_once;
+} /* namespace */
+
+void geps_roctx_push_c(const char *name) {
+  std::call_once(g_roctx_once, roctx_load);
+  if (g_roctx_push)
+    g_roctx_push(name);
+}
+
+void geps_roctx_pop_c() {
+  std::call_once(g_roctx_once, roctx_load);
+  if (g_roctx_pop)
+    g_roctx_pop();
+}
 
 int64_t geps_acc_get_stream(int async_id) {
   return (int64_t)(uintptr_t)stream_for(async_id);
